@@ -788,6 +788,52 @@ export function crossFill(img: ImageData, mask: Uint8Array): boolean {
   return true;
 }
 
+/**
+ * Расстояние (chamfer, 4-связное) от каждого пикселя маски до ближайшего
+ * пикселя ВНЕ маски. Нужно для «чистовой» полосы Telea у границы знака.
+ */
+function distInsideToBoundary(mask: Uint8Array, w: number, h: number): Uint16Array {
+  const n = w * h;
+  const d = new Uint16Array(n);
+  const BIG = 65534;
+  for (let i = 0; i < n; i++) d[i] = mask[i] ? BIG : 0;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      if (d[i] === 0) continue;
+      let v = d[i];
+      if (x > 0) {
+        const t = d[i - 1] + 1;
+        if (t < v) v = t;
+      }
+      if (y > 0) {
+        const t = d[i - w] + 1;
+        if (t < v) v = t;
+      }
+      d[i] = v;
+    }
+  }
+  for (let y = h - 1; y >= 0; y--) {
+    const row = y * w;
+    for (let x = w - 1; x >= 0; x--) {
+      const i = row + x;
+      if (d[i] === 0) continue;
+      let v = d[i];
+      if (x < w - 1) {
+        const t = d[i + 1] + 1;
+        if (t < v) v = t;
+      }
+      if (y < h - 1) {
+        const t = d[i + w] + 1;
+        if (t < v) v = t;
+      }
+      d[i] = v;
+    }
+  }
+  return d;
+}
+
 // ============================================================================
 // Адаптивный оркестратор: фиксированное время кадра при любом размере маски
 // ============================================================================
@@ -884,12 +930,12 @@ export function createInpainter(opts: InpainterOptions): Inpainter {
         // расстоянии — градиент сохраняется, каши в форме маски нет.
         useTelea = false;
       } else {
-        // Радиус Telea подбирается ПОД БЮДЖЕТ: count·πR² ≤ budget.
-        // Пока окрестность полноценная (r ≥ 5) — Telea: структурное
-        // продолжение фона. Маска слишком крупная → crossFill.
+        // Чистый Telea — только если ВЕСЬ запрошенный радиус влезает в бюджет
+        // (count·πR² ≤ budget). Иначе — двухпроходная схема (crossFill +
+        // Telea-шов): она лучше на жирном тексте и крупных масках.
         const rMax = Math.floor(Math.sqrt(opts.budget / (Math.PI * Math.max(1, count))));
-        teleaR = Math.max(2, Math.min(radius, rMax));
-        useTelea = rMax >= 5;
+        teleaR = radius;
+        useTelea = rMax >= radius;
       }
     }
     lastDx = dx;
@@ -912,11 +958,58 @@ export function createInpainter(opts: InpainterOptions): Inpainter {
     if (mode === "smart" && useTelea) {
       inpaintTelea(img, maskFull, teleaR);
     } else if (mode === "smart") {
-      // крупная область: продолжение фона по строкам/столбцам.
-      // Каждый пиксель получает интерполяцию между ближайшими известными
-      // слева/справа и сверху/снизу — градиент неба/стены сохраняется,
-      // «цветовой каши» в форме маски не возникает.
+      // Двухпроходный «Подбор фона» для крупных масок и больших радиусов:
+      //  1) crossFill — грубое, но структурно верное продолжение фона
+      //     (каждая строка/столбец тянется до своих известных пикселей);
+      //  2) Telea заново пересчитывает ПЕРЕХОДНУЮ ПОЛОСУ у границы знака в
+      //     полном разрешении, опираясь на реальные пиксели с обеих сторон —
+      //     шов становится резким, жирные буквы исчезают без «размазни».
+      // Ширина полосы растёт с радиусом → слайдер влияет на результат.
       crossFill(img, maskFull);
+
+      const rT = Math.max(3, Math.min(24, radius));
+      let bandW = Math.min(40, Math.max(3, Math.round(radius * 0.5)));
+
+      // периметр маски: внутренние пиксели с внешним 4-соседом
+      let perim = 0;
+      for (let y = 0; y < bh; y++) {
+        const row = y * bw;
+        for (let x = 0; x < bw; x++) {
+          const i = row + x;
+          if (!maskFull[i]) continue;
+          if (
+            x === 0 || x === bw - 1 || y === 0 || y === bh - 1 ||
+            !maskFull[i - 1] || !maskFull[i + 1] || !maskFull[i - bw] || !maskFull[i + bw]
+          ) {
+            perim++;
+          }
+        }
+      }
+      let rTeff = rT;
+      let piRT2 = Math.PI * rTeff * rTeff;
+      while (bandW > 3 && perim * bandW * piRT2 > opts.budget * 1.2) bandW -= 2;
+      if (perim * bandW * piRT2 > opts.budget * 1.5 && rTeff > 5) {
+        // всё ещё дорого — сужаем окрестность Telea, шов оставляем
+        rTeff = 5;
+        piRT2 = Math.PI * rTeff * rTeff;
+      }
+
+      if (perim > 0 && bandW >= 3 && perim * bandW * piRT2 <= opts.budget * 1.5) {
+        const dist = distInsideToBoundary(maskFull, bw, bh);
+        const bandMask = new Uint8Array(n);
+        let bandCount = 0;
+        for (let i = 0; i < n; i++) {
+          if (maskFull[i] && dist[i] <= bandW) {
+            bandMask[i] = 1;
+            bandCount++;
+          }
+        }
+        // Telea по полосе: «известно» всё, кроме полосы — и внешний фон,
+        // и уже заполненная сердцевина; волна даёт резкий структурный шов.
+        if (bandCount > 0 && bandCount < n) {
+          inpaintTelea(img, bandMask, rTeff);
+        }
+      }
     } else {
       // dissolve: то же заполнение + мягкая растушёвка границы области
       const orig = new Uint8ClampedArray(img.data);
