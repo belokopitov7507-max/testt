@@ -828,8 +828,9 @@ export function createInpainter(opts: InpainterOptions): Inpainter {
   const bw = bbox.w;
   const bh = bbox.h;
   const n = bw * bh;
-  const radius = Math.max(2, Math.min(24, Math.round(opts.radius)));
-  const feather = Math.max(3, Math.min(9, Math.round(Math.min(bw, bh) * 0.05) + 2));
+  const radius = Math.max(2, Math.min(100, Math.round(opts.radius)));
+  // растушёвка «Растворения» растёт вместе с радиусом (мягкость перехода)
+  const feather = Math.max(3, Math.min(32, Math.round(radius / 2) + 2));
   const realtime = opts.budget <= 650_000;
 
   const [maskRoiC, maskRoiCtx] = mkCanvas(bw, bh);
@@ -876,13 +877,20 @@ export function createInpainter(opts: InpainterOptions): Inpainter {
     for (let i = 0; i < n; i++) if (maskFull[i]) c++;
     count = c;
     if (mode === "smart") {
-      // Радиус Telea подбирается ПОД БЮДЖЕТ: count·πR² ≤ budget.
-      // Пока окрестность полноценная (r ≥ 5) — Telea: структурное продолжение
-      // фона. Если маска слишком крупная для Telea — crossFill: продолжение
-      // фона по строкам/столбцам, без «размазывания» цветов к центру.
-      const rMax = Math.floor(Math.sqrt(opts.budget / (Math.PI * Math.max(1, count))));
-      teleaR = Math.max(2, Math.min(radius, rMax));
-      useTelea = rMax >= 5;
+      if (radius > 24) {
+        // Радиус больше 24 px = «брать фон издалека». У Telea окрестность
+        // ограничена, поэтому широкий охват даёт crossFill: каждая строка и
+        // столбец продолжаются до ближайших известных пикселей на ЛЮБОМ
+        // расстоянии — градиент сохраняется, каши в форме маски нет.
+        useTelea = false;
+      } else {
+        // Радиус Telea подбирается ПОД БЮДЖЕТ: count·πR² ≤ budget.
+        // Пока окрестность полноценная (r ≥ 5) — Telea: структурное
+        // продолжение фона. Маска слишком крупная → crossFill.
+        const rMax = Math.floor(Math.sqrt(opts.budget / (Math.PI * Math.max(1, count))));
+        teleaR = Math.max(2, Math.min(radius, rMax));
+        useTelea = rMax >= 5;
+      }
     }
     lastDx = dx;
     lastDy = dy;

@@ -651,15 +651,20 @@ export default function MaskEditor({
                 desc="Простой способ: вся выделенная область плавно заполняется окружающим фоном."
               />
             </div>
-            {mode === "smart" && (
-              <label className="mt-3 block">
-                <div className="mb-1 flex justify-between font-mono text-[11px] text-mist-400">
-                  <span>Радиус окрестности</span>
-                  <span className="text-mark-400">{radius}px</span>
-                </div>
-                <input type="range" min={3} max={20} value={radius} onChange={(e) => setRadius(Number(e.target.value))} className="w-full" />
-              </label>
-            )}
+            <label className="mt-3 block">
+              <div className="mb-1 flex justify-between font-mono text-[11px] text-mist-400">
+                <span>Радиус окрестности</span>
+                <span className="text-mark-400">{radius}px</span>
+              </div>
+              <input type="range" min={3} max={100} value={radius} onChange={(e) => setRadius(Number(e.target.value))} className="w-full" />
+              <div className="mt-1.5 font-mono text-[10.5px] leading-snug text-mist-600">
+                {mode === "dissolve"
+                  ? `мягкость растворения: переход ${Math.max(3, Math.min(32, Math.round(radius / 2) + 2))}px`
+                  : radius <= 24
+                    ? "Telea: структура фона из окрестности знака"
+                    : "широкий охват: фон продолжается вдоль строк и столбцов, без ограничения дистанции"}
+              </div>
+            </label>
             <label className="mt-3 flex cursor-pointer items-start gap-2.5">
               <input
                 type="checkbox"

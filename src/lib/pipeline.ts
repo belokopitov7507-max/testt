@@ -120,8 +120,68 @@ function hasWebCodecs(): boolean {
     typeof g.VideoEncoder !== "undefined" &&
     typeof g.VideoFrame !== "undefined"
   );
-  // Аудиокодеры НЕ обязательны: при их отсутствии сработает гибридный путь
-  // (офлайн-кадры + запись оригинального звука в реальном времени).
+  // Аудиокодеры проверяются отдельно (probeAudioEncoders): при их отсутствии
+  // выбирается быстрый путь записи в реальном времени с живым звуком.
+}
+
+/**
+ * Честный probe аудиокодеров: реально создаём энкодер и кодируем тестовый
+ * буфер. isConfigSupported в Firefox врёт (говорит «поддерживаю», а потом
+ * падает), поэтому спрашивать бесполезно — только пробовать.
+ */
+async function probeAudioEncoders(): Promise<boolean> {
+  if (typeof g.AudioEncoder === "undefined" || typeof g.AudioData === "undefined") return false;
+  for (const codec of ["mp4a.40.2", "opus"]) {
+    const chunks: any[] = [];
+    let enc: any;
+    try {
+      enc = new g.AudioEncoder({ output: (c: any) => chunks.push(c), error: () => undefined });
+      enc.configure({
+        codec,
+        sampleRate: 48000,
+        numberOfChannels: 2,
+        bitrate: 128_000,
+        ...(codec === "opus" ? { opus: { frameDuration: 20_000 } } : {}),
+      });
+    } catch {
+      try {
+        enc?.close();
+      } catch {
+        /* */
+      }
+      continue;
+    }
+    try {
+      const len = 1024;
+      const planes = [new Float32Array(len), new Float32Array(len)];
+      for (let i = 0; i < len; i++) {
+        const v = Math.sin(i / 20) * 0.1;
+        planes[0][i] = v;
+        planes[1][i] = v;
+      }
+      const ad = new g.AudioData({
+        format: "f32-planar",
+        sampleRate: 48000,
+        numberOfFrames: len,
+        numberOfChannels: 2,
+        timestamp: 0,
+        planes,
+      });
+      enc.encode(ad);
+      ad.close();
+      await enc.flush();
+      if (chunks.length > 0) return true;
+    } catch {
+      /* пробуем следующий кодек */
+    } finally {
+      try {
+        enc.close();
+      } catch {
+        /* */
+      }
+    }
+  }
+  return false;
 }
 
 // ---------------------------- маска ----------------------------
@@ -1390,12 +1450,22 @@ async function processWithMediaRecorder(p: Prepared, onStage: (s: string) => voi
   const inpaintCurrentFrame = (dx: number, dy: number) => inpainter.runFrame(octx, dx, dy);
 
   await seekTo(video, 0);
+  if (video.currentTime > 0.25) {
+    // перемотка не применилась — форсируем напрямую
+    video.currentTime = 0;
+    await sleep(150);
+  }
   if (cancelled.current) throw new Error("__cancelled__");
 
   onStage("Восстанавливаем кадры (реальное время)…");
   rec.start(manualFrames ? 250 : 500);
   try {
     await video.play();
+    if (video.ended || video.paused) {
+      // крайний случай: элемент остался в конце — перезапускаем с начала
+      video.currentTime = 0;
+      await video.play();
+    }
   } catch {
     rec.stop();
     await stopped;
@@ -1481,12 +1551,23 @@ export async function processVideo(opts: ProcessOptions): Promise<ProcessResult 
     const p = await prepare(opts);
 
     if (hasWebCodecs()) {
-      // WebCodecs-путь сам разбирается со звуком:
-      //  • есть аудиокодеры → офлайн-контейнер (MP4/WebM) с перекодированной
-      //    дорожкой и ТОЧНЫМ числом кадров;
-      //  • аудиокодеров нет → гибридный путь: офлайн-восстановленные кадры
-      //    проигрываются синхронно с оригинальным звуком, который пишется
-      //    в MediaRecorder — тоже без пропусков кадров.
+      // Быстро и честно проверяем аудиокодеры. Если их нет — сразу идём
+      // БЫСТРЫМ путём: один проход в реальном времени, кадры восстанавливаются
+      // на лету (инпейнтинг сейчас дешёвый — бюджет ограничен), оригинальный
+      // звук кодирует сам MediaRecorder. Никакой медленной офлайн-фазы.
+      const audioOk = await probeAudioEncoders();
+      if (!audioOk) {
+        opts.onStage("Быстрый путь: восстановление + запись звука в реальном времени…");
+        try {
+          return await processWithMediaRecorder(p, opts.onStage);
+        } catch (e0) {
+          const m0 = (e0 as Error)?.message ?? "";
+          if (m0 === "__cancelled__") return null;
+          console.warn("Быстрый путь не сработал, пробуем WebCodecs:", e0);
+        }
+      }
+      // Есть аудиокодеры → офлайн-контейнер (MP4/WebM) с перекодированной
+      // дорожкой и ТОЧНЫМ числом кадров.
       try {
         const res = await processWithWebCodecs(p, opts.sourceBlob, opts.onStage);
         // Крайняя страховка: звук в источнике есть, но ни один способ не
