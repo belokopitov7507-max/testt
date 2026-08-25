@@ -155,8 +155,7 @@ function estimateNoise(data: Uint8ClampedArray, w: number, h: number, wasInside:
 }
 
 /** Перенос шума фона в восстановленную зону (против «гладкой заплатки»). */
-function applyGrain(img: ImageData, wasInside: Uint8Array): void {
-  const sigma = estimateNoise(img.data, img.width, img.height, wasInside);
+function applyGrain(img: ImageData, wasInside: Uint8Array, sigma: number): void {
   if (sigma < 0.75) return;
   const sLuma = sigma * 0.9;
   const sChroma = sigma * 0.45;
@@ -361,8 +360,8 @@ export function inpaintTelea(
     }
   }
 
-  // grain transfer: оцениваем σ фона и добавляем такой же шум в зону
-  applyGrain(img, wasInside);
+  // зерно добавляет оркестратор (createInpainter) с кешированной оценкой σ —
+  // иначе оценка шума съедала бы бюджет каждого кадра
   return true;
 }
 
@@ -667,18 +666,6 @@ export interface Inpainter {
   runFrame(octx: CanvasRenderingContext2D, dx: number, dy: number): void;
 }
 
-const CROSS2: ReadonlyArray<readonly [number, number]> = [
-  [0, 0],
-  [1, 0],
-  [-1, 0],
-  [0, 1],
-  [0, -1],
-  [2, 0],
-  [-2, 0],
-  [0, 2],
-  [0, -2],
-];
-
 function mkCanvas(w: number, h: number): [HTMLCanvasElement, CanvasRenderingContext2D] {
   const c = document.createElement("canvas");
   c.width = w;
@@ -698,55 +685,74 @@ export function createInpainter(opts: InpainterOptions): Inpainter {
 
   const [maskRoiC, maskRoiCtx] = mkCanvas(bw, bh);
   const maskFull = new Uint8Array(n);
+  const maskDil = new Uint8Array(n);
 
-  // smart: Telea полным радиусом, пока маска укладывается в бюджет;
-  // для больших масок — гармоническая диффузия в ПОЛНОМ разрешении
-  const teleaThreshold = realtime ? 7_000 : 22_000;
-  let inited = false;
-  let teleaFull = true;
+  let lastDx = Number.NaN;
+  let lastDy = Number.NaN;
+  let count = 0;
   let teleaR = radius;
+  let useTelea = mode === "smart";
+  let sigmaCache = -1;
 
-  const init = (count: number) => {
-    if (mode === "smart") {
-      teleaFull = count <= teleaThreshold;
-      if (!teleaFull) {
-        teleaR = Math.max(3, Math.floor(Math.sqrt(Math.max(1, opts.budget / Math.max(1, count)) / Math.PI)));
+  /**
+   * Извлечь маску ROI. Вызывается только при СМЕНЕ смещения (для статичного
+   * знака — один раз на всё видео): один drawImage + порог + крестовая
+   * дилатация массивом (дешевле, чем 9 drawImage полного канваса).
+   */
+  const extractMask = (dx: number, dy: number) => {
+    maskRoiCtx.clearRect(0, 0, bw, bh);
+    maskRoiCtx.drawImage(maskCanvas, -bbox.x + dx, -bbox.y + dy);
+    const md = maskRoiCtx.getImageData(0, 0, bw, bh).data;
+    for (let i = 0, j = 3; i < n; i++, j += 4) maskFull[i] = md[j] > 120 ? 255 : 0;
+    // дилатация ~2px (перехват гало/антиалиасинга по краю маски)
+    for (let pass = 0; pass < 2; pass++) {
+      const src = pass === 0 ? maskFull : maskDil;
+      const dst = pass === 0 ? maskDil : maskFull;
+      for (let y = 0; y < bh; y++) {
+        const row = y * bw;
+        for (let x = 0; x < bw; x++) {
+          const i = row + x;
+          let v = src[i];
+          if (!v) {
+            if (x > 0 && src[i - 1]) v = 255;
+            else if (x < bw - 1 && src[i + 1]) v = 255;
+            else if (y > 0 && src[i - bw]) v = 255;
+            else if (y < bh - 1 && src[i + bw]) v = 255;
+          }
+          dst[i] = v;
+        }
       }
     }
-    inited = true;
+    let c = 0;
+    for (let i = 0; i < n; i++) if (maskFull[i]) c++;
+    count = c;
+    if (mode === "smart") {
+      // Радиус Telea подбирается ПОД БЮДЖЕТ: count·πR² ≤ budget.
+      // Telea остаётся Telea при любом размере маски — никакой подмены
+      // диффузией и никакого даунскейла; для гигантских масок (r<2)
+      // используется гармоническая диффузия в полном разрешении.
+      const rMax = Math.floor(Math.sqrt(opts.budget / (Math.PI * Math.max(1, count))));
+      teleaR = Math.max(2, Math.min(radius, rMax));
+      useTelea = rMax >= 2;
+    }
+    lastDx = dx;
+    lastDy = dy;
   };
 
-  const passesFor = (count: number) => {
-    const base = realtime ? 2_400_000 : 9_000_000;
-    return Math.max(30, Math.min(110, Math.round(base / Math.max(2000, count))));
+  const passesFor = (cnt: number) => {
+    const base = realtime ? 900_000 : 10_000_000;
+    return Math.max(20, Math.min(90, Math.round(base / Math.max(2000, cnt))));
   };
 
   const runFrame = (octx: CanvasRenderingContext2D, dx: number, dy: number) => {
-    // 1) маска ROI с крестовым расширением ~2px (перехват гало/антиалиасинга)
-    maskRoiCtx.clearRect(0, 0, bw, bh);
-    const ox = -bbox.x + dx;
-    const oy = -bbox.y + dy;
-    for (let k = 0; k < CROSS2.length; k++) {
-      maskRoiCtx.drawImage(maskCanvas, ox + CROSS2[k][0], oy + CROSS2[k][1]);
-    }
-    const md = maskRoiCtx.getImageData(0, 0, bw, bh).data;
-    let count = 0;
-    for (let i = 0, j = 3; i < n; i++, j += 4) {
-      if (md[j] > 120) {
-        maskFull[i] = 255;
-        count++;
-      } else {
-        maskFull[i] = 0;
-      }
-    }
+    // 1) маска: пересчитываем только при смене смещения (трекинг)
+    if (dx !== lastDx || dy !== lastDy) extractMask(dx, dy);
     if (count === 0 || count === n) return;
-
-    if (!inited) init(count);
 
     // 2) исходный ROI кадра
     const img = octx.getImageData(bbox.x, bbox.y, bw, bh);
 
-    if (mode === "smart" && teleaFull) {
+    if (mode === "smart" && useTelea) {
       inpaintTelea(img, maskFull, teleaR);
     } else {
       // диффузия в полном разрешении + растушёвка границы
@@ -765,8 +771,9 @@ export function createInpainter(opts: InpainterOptions): Inpainter {
       }
     }
 
-    // 3) зерно в полном разрешении — против «гладкой заплатки»
-    applyGrain(img, maskFull);
+    // 3) зерно: σ оцениваем один раз за всё видео, шум генерируем каждый кадр
+    if (sigmaCache < 0) sigmaCache = estimateNoise(img.data, bw, bh, maskFull);
+    applyGrain(img, maskFull, sigmaCache);
     octx.putImageData(img, bbox.x, bbox.y);
   };
 
