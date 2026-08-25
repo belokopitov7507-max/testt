@@ -241,6 +241,282 @@ function dilateCanvas(src: HTMLCanvasElement, passes: number): HTMLCanvasElement
   return c;
 }
 
+// ---------------------------- авто-детекция пикселей знака ----------------------------
+//
+// Восстанавливать ВЕСЬ прямоугольник пользователя нельзя: чистый фон внутри
+// выделения заменяется интерполяцией и выглядит как плоская цветная заплатка.
+// Поэтому внутри выделения мы находим пиксели самого знака:
+//   1) края = |I − blur(I)| > адаптивный порог (контур текста/логотипа);
+//   2) заливка: всё, что НЕ достижимо от границы ROI по не-краям, —
+//      внутренность знаков (буквы целиком, а не только контур);
+//   3) фильтрация компонент по размеру и плотности краёв (отсекает облака/шум);
+//   4) расширение на 3px + «неуверенная полоса» (полупрозрачное гало знака);
+//   5) ЖЁСТКОЕ ограничение маской пользователя (выделение + 2px) — наружу
+//      ничего не вылезает.
+// Если знак не найден (< 16 px) — удаляется вся выделенная область целиком.
+
+function blurLum(src: Float32Array, w: number, h: number, r: number): Float32Array {
+  const tmp = new Float32Array(src.length);
+  const out = new Float32Array(src.length);
+  const k = r * 2 + 1;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let acc = 0;
+    for (let x = -r; x <= r; x++) acc += src[row + Math.min(w - 1, Math.max(0, x))];
+    for (let x = 0; x < w; x++) {
+      tmp[row + x] = acc / k;
+      acc += src[row + Math.min(w - 1, x + r + 1)] - src[row + Math.max(0, x - r)];
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let acc = 0;
+    for (let y = -r; y <= r; y++) acc += tmp[Math.min(h - 1, Math.max(0, y)) * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = acc / k;
+      acc += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x];
+    }
+  }
+  return out;
+}
+
+function dilateU8(src: Uint8Array, w: number, h: number, iters: number): Uint8Array {
+  let a: Uint8Array = src;
+  let b: Uint8Array = new Uint8Array(src.length);
+  for (let it = 0; it < iters; it++) {
+    for (let y = 0; y < h; y++) {
+      const row = y * w;
+      for (let x = 0; x < w; x++) {
+        const i = row + x;
+        let v = a[i];
+        if (!v) {
+          if (x > 0 && a[i - 1]) v = 1;
+          else if (x < w - 1 && a[i + 1]) v = 1;
+          else if (y > 0 && a[i - w]) v = 1;
+          else if (y < h - 1 && a[i + w]) v = 1;
+        }
+        b[i] = v;
+      }
+    }
+    const t = a;
+    a = b;
+    b = t;
+  }
+  return a;
+}
+
+function clampBBox(bb: BBox, W: number, H: number): BBox {
+  const x = Math.max(1, Math.min(bb.x, W - 3));
+  const y = Math.max(1, Math.min(bb.y, H - 3));
+  return {
+    x,
+    y,
+    w: Math.max(2, Math.min(bb.w, W - 1 - x)),
+    h: Math.max(2, Math.min(bb.h, H - 1 - y)),
+  };
+}
+
+/**
+ * Найти пиксели знака в кадре (fctx — уже нарисованный полный кадр).
+ * Возвращает полноразмерную маску, ограниченную userBox+2px, либо null.
+ */
+function detectTightMaskFromFrame(
+  fctx: CanvasRenderingContext2D,
+  workBox: BBox,
+  userBox: BBox,
+  W: number,
+  H: number,
+): HTMLCanvasElement | null {
+  const bw = workBox.w;
+  const bh = workBox.h;
+  if (bw < 12 || bh < 12) return null;
+  const roi = fctx.getImageData(workBox.x, workBox.y, bw, bh);
+  const n = bw * bh;
+
+  const lum = new Float32Array(n);
+  for (let i = 0, q = 0; i < n; i++, q += 4) {
+    lum[i] = roi.data[q] * 0.299 + roi.data[q + 1] * 0.587 + roi.data[q + 2] * 0.114;
+  }
+  const blurR = Math.min(8, Math.max(2, Math.round(Math.min(bw, bh) / 16)));
+  const blurred = blurLum(blurLum(lum, bw, bh, blurR), bw, bh, blurR);
+
+  const diff = new Float32Array(n);
+  let mean = 0;
+  for (let i = 0; i < n; i++) {
+    diff[i] = Math.abs(lum[i] - blurred[i]);
+    mean += diff[i];
+  }
+  mean /= n;
+  let std = 0;
+  for (let i = 0; i < n; i++) {
+    const d = diff[i] - mean;
+    std += d * d;
+  }
+  std = Math.sqrt(std / n);
+  const T = Math.max(10, Math.min(60, mean + 3.2 * std));
+
+  const edges = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    if (diff[i] > T) edges[i] = 1;
+  }
+  const edgesD = dilateU8(edges, bw, bh, 2);
+
+  // заливка снаружи: flood-fill от границы ROI по не-краям (4-связность)
+  const outside = new Uint8Array(n);
+  const stack = new Int32Array(n);
+  let sp = 0;
+  const pushIf = (i: number) => {
+    if (!edgesD[i] && !outside[i]) {
+      outside[i] = 1;
+      stack[sp++] = i;
+    }
+  };
+  for (let x = 0; x < bw; x++) {
+    pushIf(x);
+    pushIf((bh - 1) * bw + x);
+  }
+  for (let y = 0; y < bh; y++) {
+    pushIf(y * bw);
+    pushIf(y * bw + bw - 1);
+  }
+  while (sp > 0) {
+    const i = stack[--sp];
+    const x = i % bw;
+    const y = (i - x) / bw;
+    if (x > 0) pushIf(i - 1);
+    if (x < bw - 1) pushIf(i + 1);
+    if (y > 0) pushIf(i - bw);
+    if (y < bh - 1) pushIf(i + bw);
+  }
+
+  // компоненты связности внутренностей (8-связность)
+  const labels = new Int32Array(n);
+  const compSize: number[] = [0];
+  const compEdge: number[] = [0];
+  let nComps = 0;
+  for (let i = 0; i < n; i++) {
+    if (outside[i] || labels[i]) continue;
+    nComps++;
+    labels[i] = nComps;
+    stack[0] = i;
+    sp = 1;
+    let size = 0;
+    let ec = 0;
+    while (sp > 0) {
+      const j = stack[--sp];
+      size++;
+      if (edges[j]) ec++;
+      const x = j % bw;
+      const y = (j - x) / bw;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= bh) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          if (!dx && !dy) continue;
+          const xx = x + dx;
+          if (xx < 0 || xx >= bw) continue;
+          const kk = yy * bw + xx;
+          if (!outside[kk] && !labels[kk]) {
+            labels[kk] = nComps;
+            stack[sp++] = kk;
+          }
+        }
+      }
+    }
+    compSize.push(size);
+    compEdge.push(ec);
+  }
+
+  const kept = new Uint8Array(n);
+  let keptCount = 0;
+  for (let i = 0; i < n; i++) {
+    if (outside[i]) continue;
+    const c = labels[i];
+    const ok = compSize[c] >= 10 && compSize[c] <= 0.65 * n && compEdge[c] >= Math.max(6, compSize[c] * 0.02);
+    if (ok) {
+      kept[i] = 1;
+      keptCount++;
+    }
+  }
+  if (keptCount < 16 || keptCount > 0.7 * n) return null;
+
+  // расширение + неуверенная полоса (полупрозрачное гало знака)
+  let mask = dilateU8(kept, bw, bh, 3);
+  const band = dilateU8(kept, bw, bh, 7);
+  const T2 = Math.max(6, T * 0.45);
+  for (let i = 0; i < n; i++) {
+    if (band[i] && !mask[i] && diff[i] > T2) mask[i] = 1;
+  }
+
+  // перенос в полноразмерную маску с жёстким ограничением userBox + 2px
+  const canvas = document.createElement("canvas");
+  canvas.width = W;
+  canvas.height = H;
+  const mctx = canvas.getContext("2d")!;
+  const id = mctx.createImageData(W, H);
+  const x0 = userBox.x - 2;
+  const y0 = userBox.y - 2;
+  const x1 = userBox.x + userBox.w + 2;
+  const y1 = userBox.y + userBox.h + 2;
+  let written = 0;
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      if (!mask[y * bw + x]) continue;
+      const vx = workBox.x + x;
+      const vy = workBox.y + y;
+      if (vx < x0 || vx >= x1 || vy < y0 || vy >= y1) continue; // не вылезать за выделение
+      const q = (vy * W + vx) * 4;
+      id.data[q] = 255;
+      id.data[q + 1] = 255;
+      id.data[q + 2] = 255;
+      id.data[q + 3] = 255;
+      written++;
+    }
+  }
+  if (written < 16) return null;
+  mctx.putImageData(id, 0, 0);
+  return canvas;
+}
+
+/**
+ * Построить эффективную маску для обработки:
+ *  — пиксели знака, найденные внутри выделения (приоритет), либо
+ *  — вся выделенная область целиком, если знак не обнаружен.
+ */
+export async function buildEffectiveMask(
+  video: HTMLVideoElement,
+  maskCanvas: HTMLCanvasElement,
+  radius: number,
+): Promise<{ mask: HTMLCanvasElement; bbox: BBox } | null> {
+  const W = video.videoWidth;
+  const H = video.videoHeight;
+  const userBox = maskBBox(maskCanvas, 0);
+  if (!userBox) return null;
+  const pad = Math.min(48, radius * 2 + 8);
+  const workBoxRaw = maskBBox(maskCanvas, pad);
+  if (!workBoxRaw) return null;
+  const workBox = clampBBox(workBoxRaw, W, H);
+
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext("2d", { willReadFrequently: true })!;
+  await seekTo(video, Math.min(0.15, Math.max(0.02, (video.duration || 1) * 0.05)));
+  await awaitFrame(video);
+  ctx.drawImage(video, 0, 0, W, H);
+
+  let tight: HTMLCanvasElement | null = null;
+  try {
+    tight = detectTightMaskFromFrame(ctx, workBox, userBox, W, H);
+  } catch (e) {
+    console.warn("Авто-детекция знака не удалась — используется вся область:", e);
+  }
+  if (!tight) {
+    return { mask: dilateCanvas(maskCanvas, 2), bbox: workBox };
+  }
+  const tb = maskBBox(tight, pad);
+  return { mask: tight, bbox: tb ? clampBBox(tb, W, H) : workBox };
+}
+
 // ---------------------------- FPS источника ----------------------------
 
 const STD_FPS = [23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60];
@@ -539,22 +815,12 @@ async function prepare(opts: ProcessOptions): Promise<Prepared> {
     throw new Error("Не удалось определить длительность видео. Попробуйте другой файл (MP4/WebM).");
   }
 
-  onStage("Подготовка маски…");
-  const pad = Math.min(48, settings.radius * 2 + 8);
-  let bbox = maskBBox(opts.maskCanvas, pad);
-  if (!bbox) throw new Error("Маска пуста — сначала выделите область водяного знака");
-  // не даём ROI прилипнуть к краям кадра (иначеTelea не сработает у границы)
-  bbox = {
-    x: Math.max(1, bbox.x),
-    y: Math.max(1, bbox.y),
-    w: Math.min(W - 2 - Math.max(1, bbox.x), bbox.w),
-    h: Math.min(H - 2 - Math.max(1, bbox.y), bbox.h),
-  };
-
-  // маска = ВСЯ выделенная пользователем область (прямоугольник + кисть),
-  // расширенная на 2 px, чтобы перехватить антиалиасинг и гало знака.
-  const effectiveMask = dilateCanvas(opts.maskCanvas, 2);
+  onStage("Ищем пиксели знака внутри выделения…");
+  const eff = await buildEffectiveMask(video, opts.maskCanvas, settings.radius);
+  if (!eff) throw new Error("Маска пуста — сначала выделите область водяного знака");
   if (cancelled.current) throw new Error("__cancelled__");
+  const bbox = eff.bbox;
+  const effectiveMask = eff.mask;
 
   let lastEmit = 0;
   const emit = (p: Progress, force = false) => {

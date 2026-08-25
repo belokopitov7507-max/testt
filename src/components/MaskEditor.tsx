@@ -177,23 +177,24 @@ export default function MaskEditor({
     setPreviewBusy(true);
     try {
       const { createInpainter } = await import("../lib/inpaint");
-      const { maskBBox } = await import("../lib/pipeline");
+      const { buildEffectiveMask } = await import("../lib/pipeline");
       const W = video.videoWidth;
       const H = video.videoHeight;
       out.width = W;
       out.height = H;
       const octx = out.getContext("2d", { willReadFrequently: true })!;
-      octx.drawImage(video, 0, 0, W, H);
       const mask = maskCanvasRef.current!;
-      const pad = Math.min(48, radiusRef.current * 2 + 8);
-      const bbox = maskBBox(mask, pad);
-      if (!bbox) {
+      // тот же путь, что и при обработке: детекция пикселей знака внутри
+      // выделения (или вся область, если знак не найден)
+      const eff = await buildEffectiveMask(video, mask, radiusRef.current);
+      if (!eff) {
         notify("Сначала выделите область знака", "error");
         return;
       }
+      octx.drawImage(video, 0, 0, W, H);
       const inpainter = createInpainter({
-        bbox,
-        maskCanvas: mask,
+        bbox: eff.bbox,
+        maskCanvas: eff.mask,
         radius: radiusRef.current,
         budget: 2_400_000, // превью — разовый вызов, качество максимальное
         mode: modeRef.current,
