@@ -118,69 +118,10 @@ function pickMime(): string | null {
 function hasWebCodecs(): boolean {
   return (
     typeof g.VideoEncoder !== "undefined" &&
-    typeof g.VideoFrame !== "undefined" &&
-    typeof g.AudioEncoder !== "undefined" &&
-    typeof g.AudioData !== "undefined"
+    typeof g.VideoFrame !== "undefined"
   );
-}
-
-/**
- * Честный probe аудиокодеров: реально создаём энкодер и кодируем тестовый
- * буфер. isConfigSupported в Firefox врёт (говорит «поддерживаю», а потом
- * падает), поэтому спрашивать бесполезно — только пробовать.
- */
-async function probeAudioEncoders(): Promise<boolean> {
-  for (const codec of ["mp4a.40.2", "opus"]) {
-    const chunks: any[] = [];
-    let enc: any;
-    try {
-      enc = new g.AudioEncoder({ output: (c: any) => chunks.push(c), error: () => undefined });
-      enc.configure({
-        codec,
-        sampleRate: 48000,
-        numberOfChannels: 2,
-        bitrate: 128_000,
-        ...(codec === "opus" ? { opus: { frameDuration: 20_000 } } : {}),
-      });
-    } catch {
-      try {
-        enc?.close();
-      } catch {
-        /* */
-      }
-      continue;
-    }
-    try {
-      const len = 1024;
-      const planes = [new Float32Array(len), new Float32Array(len)];
-      for (let i = 0; i < len; i++) {
-        const v = Math.sin(i / 20) * 0.1;
-        planes[0][i] = v;
-        planes[1][i] = v;
-      }
-      const ad = new g.AudioData({
-        format: "f32-planar",
-        sampleRate: 48000,
-        numberOfFrames: len,
-        numberOfChannels: 2,
-        timestamp: 0,
-        data: planes,
-      });
-      enc.encode(ad);
-      ad.close();
-      await enc.flush();
-      if (chunks.length > 0) return true;
-    } catch {
-      /* пробуем следующий кодек */
-    } finally {
-      try {
-        enc.close();
-      } catch {
-        /* */
-      }
-    }
-  }
-  return false;
+  // Аудиокодеры НЕ обязательны: при их отсутствии сработает гибридный путь
+  // (офлайн-кадры + запись оригинального звука в реальном времени).
 }
 
 // ---------------------------- маска ----------------------------
@@ -439,9 +380,9 @@ function detectTightMaskFromFrame(
   }
   if (keptCount < 16 || keptCount > 0.7 * n) return null;
 
-  // расширение + неуверенная полоса (полупрозрачное гало знака)
+  // расширение + неуверенная полоса (полупрозрачное гало и антиалиасинг знака)
   let mask = dilateU8(kept, bw, bh, 3);
-  const band = dilateU8(kept, bw, bh, 7);
+  const band = dilateU8(kept, bw, bh, 8);
   const T2 = Math.max(6, T * 0.45);
   for (let i = 0; i < n; i++) {
     if (band[i] && !mask[i] && diff[i] > T2) mask[i] = 1;
@@ -994,77 +935,36 @@ async function pickVpxCodec(W: number, H: number, fps: number): Promise<string |
   return null;
 }
 
-async function processWithWebCodecs(p: Prepared, sourceBlob: Blob, onStage: (s: string) => void): Promise<ProcessResult> {
+interface OfflineEncode {
+  chunks: Array<{ chunk: any; meta: any }>;
+  decoderConfig: any;
+  frames: number;
+}
+
+/**
+ * Офлайн-проход: покадровый seek → восстановление → VideoEncoder.
+ * Таймстампы i/fps — точное число кадров без пропусков, независимо от
+ * скорости машины. Возвращает сжатые чанки + конфигурацию декодера
+ * (нужна для гибридного пути с живым звуком).
+ */
+async function encodeVideoOffline(
+  p: Prepared,
+  fps: number,
+  codec: string,
+  encW: number,
+  encH: number,
+  onStage: (s: string) => void,
+): Promise<OfflineEncode> {
   const { video, outCanvas, octx, W, H, duration, bbox, settings, cancelled, track, emit } = p;
 
-  onStage("Измеряем FPS источника…");
-  const fps = await measureFps(video, cancelled);
-  if (cancelled.current) throw new Error("__cancelled__");
-
-  const encW = W % 2 === 0 ? W : W + 1;
-  const encH = H % 2 === 0 ? H : H + 1;
-
-  // ---------- звук: декодируем оригинальную дорожку и реально пробуем кодеки ----------
-  onStage("Декодируем оригинальную аудиодорожку…");
-  const audioBuf = await decodeSourceAudio(sourceBlob, duration);
-  if (cancelled.current) throw new Error("__cancelled__");
-
-  // audioStatus: aac/opus — звук перенесён; none — в источнике звука нет;
-  // silent — звук в источнике есть, но энкодеры не сработали (нужен запасной путь)
-  let audioStatus: AudioStatus = audioBuf ? "silent" : "none";
-  let container: "mp4" | "webm" = "mp4";
-  let audioChunks: Array<{ chunk: any; meta: any }> = [];
-
-  if (audioBuf) {
-    // 1) AAC → контейнер MP4
-    onStage("Кодируем звук (AAC)…");
-    audioChunks = await encodeAudioChunks(audioBuf, duration, "mp4a.40.2", cancelled);
-    if (audioChunks.length > 0) {
-      audioStatus = "aac";
-    } else {
-      // 2) Opus → контейнер WebM
-      onStage("Кодируем звук (Opus)…");
-      audioChunks = await encodeAudioChunks(audioBuf, duration, "opus", cancelled);
-      if (audioChunks.length > 0) {
-        audioStatus = "opus";
-        container = "webm";
-      }
-    }
-    if (cancelled.current) throw new Error("__cancelled__");
-  }
-  const hasAudio = audioChunks.length > 0;
-
-  // ---------- видеокодек и контейнер ----------
-  let codec: string;
-  let muxer: any;
-  if (container === "mp4") {
-    const avc = await pickAvcCodec(encW, encH, fps);
-    if (!avc) throw new Error("__no_webcodecs__");
-    codec = avc;
-    muxer = new Muxer({
-      target: new ArrayBufferTarget(),
-      fastStart: "in-memory",
-      video: { codec: "avc", width: encW, height: encH },
-      audio: hasAudio
-        ? { codec: "aac", numberOfChannels: audioBuf!.numberOfChannels, sampleRate: audioBuf!.sampleRate }
-        : undefined,
-    });
-  } else {
-    const vpx = await pickVpxCodec(encW, encH, fps);
-    if (!vpx) throw new Error("__no_webcodecs__");
-    codec = vpx;
-    muxer = new WebMMuxer({
-      target: new WebMArrayBufferTarget(),
-      video: { codec: vpx.startsWith("vp8") ? "V_VP8" : "V_VP9", width: encW, height: encH },
-      audio: hasAudio
-        ? { codec: "A_OPUS", numberOfChannels: audioBuf!.numberOfChannels, sampleRate: audioBuf!.sampleRate }
-        : undefined,
-    });
-  }
-
+  const chunks: Array<{ chunk: any; meta: any }> = [];
+  let decoderConfig: any = null;
   let encoderError: Error | null = null;
   const encoder = new g.VideoEncoder({
-    output: (chunk: any, meta: any) => muxer.addVideoChunk(chunk, meta),
+    output: (chunk: any, meta: any) => {
+      chunks.push({ chunk, meta });
+      if (!decoderConfig && meta && meta.decoderConfig) decoderConfig = meta.decoderConfig;
+    },
     error: (e: any) => {
       encoderError = e instanceof Error ? e : new Error(String(e?.message ?? e));
     },
@@ -1080,11 +980,6 @@ async function processWithWebCodecs(p: Prepared, sourceBlob: Blob, onStage: (s: 
     });
   } catch {
     throw new Error("__no_webcodecs__");
-  }
-
-  // записываем готовые аудио-чанки в контейнер
-  for (const { chunk, meta } of audioChunks) {
-    muxer.addAudioChunk(chunk, meta);
   }
 
   // бюджет для офлайн-пути щедрый: качество максимальное, время не критично
@@ -1128,7 +1023,7 @@ async function processWithWebCodecs(p: Prepared, sourceBlob: Blob, onStage: (s: 
 
     frames++;
     const el = (performance.now() - t0) / 1000;
-    emit({ pct: 8 + Math.min(88, ((i + 1) / N) * 88), t, duration, frames, fps: el > 0.5 ? frames / el : 0 });
+    emit({ pct: 8 + Math.min(80, ((i + 1) / N) * 80), t, duration, frames, fps: el > 0.5 ? frames / el : 0 });
   }
 
   if (cancelled.current) {
@@ -1142,10 +1037,264 @@ async function processWithWebCodecs(p: Prepared, sourceBlob: Blob, onStage: (s: 
   if (encoderError) throw encoderError;
   if (frames === 0) throw new Error("Не удалось обработать ни одного кадра");
 
-  emit({ pct: 97, t: duration, duration, frames, fps: 0 }, true);
-  onStage(container === "mp4" ? "Собираем MP4-контейнер…" : "Собираем WebM-контейнер…");
   await encoder.flush();
   encoder.close();
+  if (chunks.length === 0) throw new Error("Кодировщик не вернул данные");
+  return { chunks, decoderConfig, frames };
+}
+
+/**
+ * Гибридный путь для браузеров без аудиокодеров (AAC/Opus AudioEncoder
+ * отсутствует, но WebCodecs-видео есть): кадры УЖЕ восстановлены и сжаты
+ * офлайн (точное число кадров, полное качество), а здесь мы в реальном
+ * времени проигрываем исходный файл — его ОРИГИНАЛЬНЫЙ звук пишется в
+ * MediaRecorder, а видео-дорожка собирается из готовых кадров, которые
+ * декодируются и рисуются на холст синхронно с currentTime источника.
+ * Обработки на лету нет → кадры не пропускаются, звук — подлинный.
+ */
+async function replayProcessedWithLiveAudio(
+  p: Prepared,
+  fps: number,
+  enc: OfflineEncode,
+  onStage: (s: string) => void,
+): Promise<ProcessResult> {
+  const { video, outCanvas, octx, W, H, duration, cancelled, emit } = p;
+
+  const mime = pickMime();
+  if (!mime) throw new Error("__fallback__");
+  if (typeof g.VideoDecoder === "undefined" || !enc.decoderConfig) throw new Error("__fallback__");
+
+  outCanvas.width = W;
+  outCanvas.height = H;
+  const stream = outCanvas.captureStream(0);
+  const vtrack = stream.getVideoTracks()[0] as (MediaStreamTrack & { requestFrame?: () => void }) | undefined;
+  const manual = typeof vtrack?.requestFrame === "function";
+  const capStream = manual ? stream : outCanvas.captureStream(Math.min(60, Math.max(15, Math.round(fps))));
+
+  let recStream: MediaStream = capStream;
+  let liveAudio = false;
+  try {
+    const audio = getAudioGraph(video);
+    await audio.ctx.resume();
+    const vTracks = manual && vtrack ? [vtrack] : capStream.getVideoTracks();
+    recStream = new MediaStream([...vTracks, ...audio.dest.stream.getAudioTracks()]);
+    liveAudio = true;
+  } catch (e) {
+    console.warn("Не удалось подключить аудио к записи:", e);
+  }
+
+  // декодируем готовые чанки по мере надобности (память ограничена очередью)
+  const queue: any[] = [];
+  let feederDone = false;
+  const decoder = new g.VideoDecoder({
+    output: (f: any) => queue.push(f),
+    error: (e: any) => console.warn("VideoDecoder:", e),
+  });
+  decoder.configure(enc.decoderConfig);
+  void (async () => {
+    try {
+      for (const { chunk } of enc.chunks) {
+        if (cancelled.current) break;
+        while (decoder.decodeQueueSize > 4 && !cancelled.current) await sleep(2);
+        if (cancelled.current) break;
+        decoder.decode(chunk);
+      }
+      if (!cancelled.current) await decoder.flush();
+    } catch (e) {
+      console.warn("VideoDecoder feeder:", e);
+    } finally {
+      feederDone = true;
+    }
+  })();
+
+  const rec = new MediaRecorder(recStream, {
+    mimeType: mime,
+    videoBitsPerSecond: Math.min(16_000_000, Math.max(2_500_000, W * H * 2)),
+    audioBitsPerSecond: 192_000,
+  });
+  const chunksOut: Blob[] = [];
+  rec.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) chunksOut.push(e.data);
+  };
+  const stopped = new Promise<void>((res) => {
+    rec.onstop = () => res();
+  });
+
+  await seekTo(video, 0);
+  await awaitFrame(video);
+
+  // дожидаемся первого декодированного кадра, чтобы запись не началась с пустоты
+  {
+    const t0w = performance.now();
+    while (queue.length === 0 && !feederDone && !cancelled.current && performance.now() - t0w < 2000) {
+      await sleep(10);
+    }
+  }
+  if (cancelled.current) throw new Error("__cancelled__");
+
+  let drawn = 0;
+  const drawReady = () => {
+    const nowUs = video.currentTime * 1e6 + 12_000;
+    let drew = 0;
+    while (queue.length && queue[0].timestamp <= nowUs) {
+      const f = queue.shift();
+      try {
+        octx.drawImage(f, 0, 0, W, H);
+      } finally {
+        f.close();
+      }
+      drew++;
+    }
+    if (drew > 0 && manual) vtrack?.requestFrame?.();
+    drawn += drew;
+    return drew;
+  };
+  drawReady();
+
+  onStage("Записываем видео с оригинальным звуком…");
+  rec.start(250);
+  try {
+    // звук элемента перенаправлен в рекордер (MediaElementSource),
+    // из динамиков он не звучит
+    await video.play();
+  } catch {
+    rec.stop();
+    await stopped;
+    throw new Error("Не удалось запустить воспроизведение для записи");
+  }
+
+  await new Promise<void>((resolve) => {
+    const onEnd = () => {
+      video.removeEventListener("ended", onEnd);
+      resolve();
+    };
+    video.addEventListener("ended", onEnd);
+    const loop = () => {
+      if (cancelled.current) {
+        video.removeEventListener("ended", onEnd);
+        video.pause();
+        resolve();
+        return;
+      }
+      drawReady();
+      emit({ pct: 88 + Math.min(8, (video.currentTime / duration) * 8), t: video.currentTime, duration, frames: drawn, fps });
+      if (video.ended || (feederDone && queue.length === 0 && video.currentTime >= duration - 0.06)) {
+        video.removeEventListener("ended", onEnd);
+        resolve();
+        return;
+      }
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  });
+
+  video.pause();
+  rec.stop();
+  await stopped;
+  try {
+    decoder.close();
+  } catch {
+    /* */
+  }
+  if (cancelled.current) throw new Error("__cancelled__");
+  if (chunksOut.length === 0) throw new Error("__fallback__");
+  return {
+    blob: new Blob(chunksOut, { type: mime.split(";")[0] }),
+    ext: mime.includes("mp4") ? "mp4" : "webm",
+    mime,
+    frames: drawn > 0 ? drawn : enc.frames,
+    audio: liveAudio ? "live" : "silent",
+  };
+}
+
+async function processWithWebCodecs(p: Prepared, sourceBlob: Blob, onStage: (s: string) => void): Promise<ProcessResult> {
+  const { duration, cancelled, emit } = p;
+
+  onStage("Измеряем FPS источника…");
+  const fps = await measureFps(p.video, cancelled);
+  if (cancelled.current) throw new Error("__cancelled__");
+
+  const encW = p.W % 2 === 0 ? p.W : p.W + 1;
+  const encH = p.H % 2 === 0 ? p.H : p.H + 1;
+
+  // ---------- звук: декодируем оригинальную дорожку и реально пробуем кодеки ----------
+  onStage("Декодируем оригинальную аудиодорожку…");
+  const audioBuf = await decodeSourceAudio(sourceBlob, duration);
+  if (cancelled.current) throw new Error("__cancelled__");
+
+  // audioStatus: aac/opus — звук перенесён; none — в источнике звука нет;
+  // silent — звук в источнике есть, но энкодеры не сработали (нужен запасной путь)
+  let audioStatus: AudioStatus = audioBuf ? "silent" : "none";
+  let container: "mp4" | "webm" = "mp4";
+  let audioChunks: Array<{ chunk: any; meta: any }> = [];
+
+  if (audioBuf) {
+    // 1) AAC → контейнер MP4
+    onStage("Кодируем звук (AAC)…");
+    audioChunks = await encodeAudioChunks(audioBuf, duration, "mp4a.40.2", cancelled);
+    if (audioChunks.length > 0) {
+      audioStatus = "aac";
+    } else {
+      // 2) Opus → контейнер WebM
+      onStage("Кодируем звук (Opus)…");
+      audioChunks = await encodeAudioChunks(audioBuf, duration, "opus", cancelled);
+      if (audioChunks.length > 0) {
+        audioStatus = "opus";
+        container = "webm";
+      }
+    }
+    if (cancelled.current) throw new Error("__cancelled__");
+  }
+  const hasAudio = audioChunks.length > 0;
+
+  // ---------- видеокодек ----------
+  let codec: string | null = null;
+  if (container === "mp4") {
+    codec = await pickAvcCodec(encW, encH, fps);
+  } else {
+    codec = await pickVpxCodec(encW, encH, fps);
+  }
+  if (!codec) throw new Error("__no_webcodecs__");
+
+  // ---------- офлайн-восстановление всех кадров (точное число, без пропусков) ----------
+  const enc = await encodeVideoOffline(p, fps, codec, encW, encH, onStage);
+  emit({ pct: 88, t: duration, duration, frames: enc.frames, fps: 0 }, true);
+
+  // В источнике есть звук, но аудиокодеров в этом браузере нет →
+  // гибридный путь: готовые кадры + запись оригинального звука в реальном времени.
+  if (audioBuf && !hasAudio) {
+    return await replayProcessedWithLiveAudio(p, fps, enc, onStage);
+  }
+
+  // ---------- обычный путь: собираем контейнер (видео + звук) ----------
+  let muxer: any;
+  if (container === "mp4") {
+    muxer = new Muxer({
+      target: new ArrayBufferTarget(),
+      fastStart: "in-memory",
+      video: { codec: "avc", width: encW, height: encH },
+      audio: hasAudio
+        ? { codec: "aac", numberOfChannels: audioBuf!.numberOfChannels, sampleRate: audioBuf!.sampleRate }
+        : undefined,
+    });
+  } else {
+    muxer = new WebMMuxer({
+      target: new WebMArrayBufferTarget(),
+      video: { codec: codec.startsWith("vp8") ? "V_VP8" : "V_VP9", width: encW, height: encH },
+      audio: hasAudio
+        ? { codec: "A_OPUS", numberOfChannels: audioBuf!.numberOfChannels, sampleRate: audioBuf!.sampleRate }
+        : undefined,
+    });
+  }
+  for (const { chunk, meta } of audioChunks) {
+    muxer.addAudioChunk(chunk, meta);
+  }
+  for (const { chunk, meta } of enc.chunks) {
+    muxer.addVideoChunk(chunk, meta);
+  }
+
+  emit({ pct: 97, t: duration, duration, frames: enc.frames, fps: 0 }, true);
+  onStage(container === "mp4" ? "Собираем MP4-контейнер…" : "Собираем WebM-контейнер…");
   muxer.finalize();
 
   const buffer = (muxer.target as { buffer: ArrayBuffer }).buffer;
@@ -1155,8 +1304,8 @@ async function processWithWebCodecs(p: Prepared, sourceBlob: Blob, onStage: (s: 
     blob: new Blob([buffer], { type: mime }),
     ext: container,
     mime,
-    frames,
-    audio: hasAudio ? audioStatus : "silent",
+    frames: enc.frames,
+    audio: audioStatus,
   };
 }
 
@@ -1332,24 +1481,16 @@ export async function processVideo(opts: ProcessOptions): Promise<ProcessResult 
     const p = await prepare(opts);
 
     if (hasWebCodecs()) {
-      // Быстро и честно проверяем аудиокодеры. Если они в этом браузере не
-      // работают — сразу идём одним проходом через MediaRecorder (он кодирует
-      // звук сам), чтобы не гонять WebCodecs впустую и не терять аудио.
-      const audioOk = await probeAudioEncoders();
-      if (!audioOk && !p.cancelled.current) {
-        opts.onStage("Аудиокодеры недоступны — путь MediaRecorder (звук сохранится)…");
-        try {
-          return await processWithMediaRecorder(p, opts.onStage);
-        } catch (e0) {
-          const m0 = (e0 as Error)?.message ?? "";
-          if (m0 === "__cancelled__") return null;
-          console.warn("MediaRecorder не сработал, пробуем WebCodecs:", e0);
-        }
-      }
+      // WebCodecs-путь сам разбирается со звуком:
+      //  • есть аудиокодеры → офлайн-контейнер (MP4/WebM) с перекодированной
+      //    дорожкой и ТОЧНЫМ числом кадров;
+      //  • аудиокодеров нет → гибридный путь: офлайн-восстановленные кадры
+      //    проигрываются синхронно с оригинальным звуком, который пишется
+      //    в MediaRecorder — тоже без пропусков кадров.
       try {
         const res = await processWithWebCodecs(p, opts.sourceBlob, opts.onStage);
-        // Дополнительная страховка: источник со звуком, но кодирование аудио
-        // всё же провалилось → повторяем через MediaRecorder.
+        // Крайняя страховка: звук в источнике есть, но ни один способ не
+        // сработал → пробуем чисто рекордерный путь (он кодирует звук сам).
         if (res.audio === "silent" && !p.cancelled.current) {
           opts.onStage("Сохраняем звук: дополнительный проход (MediaRecorder)…");
           try {
@@ -1363,7 +1504,9 @@ export async function processVideo(opts: ProcessOptions): Promise<ProcessResult 
       } catch (e) {
         const msg = (e as Error)?.message ?? "";
         if (msg === "__cancelled__") return null;
-        if (msg !== "__no_webcodecs__") console.warn("WebCodecs-путь не удался, переход на MediaRecorder:", e);
+        if (msg !== "__no_webcodecs__" && msg !== "__fallback__") {
+          console.warn("WebCodecs-путь не удался, переход на MediaRecorder:", e);
+        }
         opts.onStage("WebCodecs недоступен — используем MediaRecorder…");
       }
     }

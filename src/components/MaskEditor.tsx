@@ -186,11 +186,25 @@ export default function MaskEditor({
       const mask = maskCanvasRef.current!;
       // тот же путь, что и при обработке: детекция пикселей знака внутри
       // выделения (или вся область, если знак не найден)
+      const savedTime = video.currentTime;
       const eff = await buildEffectiveMask(video, mask, radiusRef.current);
       if (!eff) {
         notify("Сначала выделите область знака", "error");
         return;
       }
+      // детекция перематывала видео — возвращаемся к кадру, который видел пользователь
+      await new Promise<void>((res) => {
+        const on = () => {
+          video.removeEventListener("seeked", on);
+          res();
+        };
+        video.addEventListener("seeked", on);
+        video.currentTime = savedTime;
+        setTimeout(() => {
+          video.removeEventListener("seeked", on);
+          res();
+        }, 350);
+      });
       octx.drawImage(video, 0, 0, W, H);
       const inpainter = createInpainter({
         bbox: eff.bbox,
@@ -627,14 +641,14 @@ export default function MaskEditor({
               <ModeCard
                 active={mode === "smart"}
                 onClick={() => setMode("smart")}
-                title="Подбор фона · Telea"
-                desc="Алгоритм достраивает структуру фона под знаком — следов не остаётся. Рекомендуется."
+                title="Подбор фона"
+                desc="Пиксели знака находятся автоматически, фон под ними достраивается (Telea / продолжение градиентов). Знака не видно. Рекомендуется."
               />
               <ModeCard
                 active={mode === "dissolve"}
                 onClick={() => setMode("dissolve")}
                 title="Растворение"
-                desc="Простой и быстрый способ: область плавно растворяется в окружении."
+                desc="Простой способ: вся выделенная область плавно заполняется окружающим фоном."
               />
             </div>
             {mode === "smart" && (

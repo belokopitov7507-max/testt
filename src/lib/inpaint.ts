@@ -640,6 +640,155 @@ function featherAlpha(mask: Uint8Array, w: number, h: number, feather: number): 
 }
 
 // ============================================================================
+// Cross-fill: попиксельное продолжение фона по строкам и столбцам.
+// Для каждого пикселя маски берутся ближайшие известные соседи слева/справа
+// (интерполяция) и сверху/снизу, результаты смешиваются с весом 1/расстояние.
+// В отличие от диффузии и Telea на больших сплошных областях, НЕ «размазывает»
+// цвета границ к центру: каждая строка сохраняет свой оттенок — градиенты и
+// плавные фоны продолжаются практически незаметно. O(n), очень быстрый.
+// ============================================================================
+
+export function crossFill(img: ImageData, mask: Uint8Array): boolean {
+  const w = img.width;
+  const h = img.height;
+  const n = w * h;
+  const d = img.data;
+
+  let count = 0;
+  for (let i = 0; i < n; i++) if (mask[i]) count++;
+  if (count === 0 || count === n) return false;
+
+  // ближайшие известные соседи по 4 направлениям (−1 = нет)
+  const leftX = new Int32Array(n);
+  const rightX = new Int32Array(n);
+  const topY = new Int32Array(n);
+  const botY = new Int32Array(n);
+
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let last = -1;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      if (!mask[i]) last = x;
+      leftX[i] = last;
+    }
+    last = -1;
+    for (let x = w - 1; x >= 0; x--) {
+      const i = row + x;
+      if (!mask[i]) last = x;
+      rightX[i] = last;
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let last = -1;
+    for (let y = 0; y < h; y++) {
+      const i = y * w + x;
+      if (!mask[i]) last = y;
+      topY[i] = last;
+    }
+    last = -1;
+    for (let y = h - 1; y >= 0; y--) {
+      const i = y * w + x;
+      if (!mask[i]) last = y;
+      botY[i] = last;
+    }
+  }
+
+  // среднее известных — запасной цвет
+  let mr = 0;
+  let mg = 0;
+  let mb = 0;
+  let mk = 0;
+  for (let i = 0; i < n; i++) {
+    if (mask[i]) continue;
+    const q = i << 2;
+    mr += d[q];
+    mg += d[q + 1];
+    mb += d[q + 2];
+    mk++;
+  }
+  mr = mk > 0 ? mr / mk : 128;
+  mg = mk > 0 ? mg / mk : 128;
+  mb = mk > 0 ? mb / mk : 128;
+
+  for (let i = 0; i < n; i++) {
+    if (!mask[i]) continue;
+    const x = i % w;
+    const y = (i - x) / w;
+    const q = i << 2;
+    let vr = 0;
+    let vg = 0;
+    let vb = 0;
+    let wsum = 0;
+
+    // горизонталь
+    const lx = leftX[i];
+    const rx = rightX[i];
+    if (lx >= 0 && rx >= 0) {
+      const dl = x - lx;
+      const dr = rx - x;
+      const s = dl + dr;
+      const ql = (y * w + lx) << 2;
+      const qr = (y * w + rx) << 2;
+      const wh = 1 / s;
+      vr += ((d[ql] * dr + d[qr] * dl) / s) * wh;
+      vg += ((d[ql + 1] * dr + d[qr + 1] * dl) / s) * wh;
+      vb += ((d[ql + 2] * dr + d[qr + 2] * dl) / s) * wh;
+      wsum += wh;
+    } else if (lx >= 0 || rx >= 0) {
+      const sx = lx >= 0 ? lx : rx;
+      const dist = lx >= 0 ? x - lx : rx - x;
+      const qs = (y * w + sx) << 2;
+      const wh = 1 / (4 * dist);
+      vr += d[qs] * wh;
+      vg += d[qs + 1] * wh;
+      vb += d[qs + 2] * wh;
+      wsum += wh;
+    }
+
+    // вертикаль
+    const ty = topY[i];
+    const by = botY[i];
+    if (ty >= 0 && by >= 0) {
+      const du = y - ty;
+      const dd = by - y;
+      const s = du + dd;
+      const qu = (ty * w + x) << 2;
+      const qd = (by * w + x) << 2;
+      const wv = 1 / s;
+      vr += ((d[qu] * dd + d[qd] * du) / s) * wv;
+      vg += ((d[qu + 1] * dd + d[qd + 1] * du) / s) * wv;
+      vb += ((d[qu + 2] * dd + d[qd + 2] * du) / s) * wv;
+      wsum += wv;
+    } else if (ty >= 0 || by >= 0) {
+      const sy = ty >= 0 ? ty : by;
+      const dist = ty >= 0 ? y - ty : by - y;
+      const qs = (sy * w + x) << 2;
+      const wv = 1 / (4 * dist);
+      vr += d[qs] * wv;
+      vg += d[qs + 1] * wv;
+      vb += d[qs + 2] * wv;
+      wsum += wv;
+    }
+
+    if (wsum > 0) {
+      let v = vr / wsum;
+      d[q] = v < 0 ? 0 : v > 255 ? 255 : v;
+      v = vg / wsum;
+      d[q + 1] = v < 0 ? 0 : v > 255 ? 255 : v;
+      v = vb / wsum;
+      d[q + 2] = v < 0 ? 0 : v > 255 ? 255 : v;
+    } else {
+      d[q] = mr;
+      d[q + 1] = mg;
+      d[q + 2] = mb;
+    }
+    d[q + 3] = 255;
+  }
+  return true;
+}
+
+// ============================================================================
 // Адаптивный оркестратор: фиксированное время кадра при любом размере маски
 // ============================================================================
 
@@ -728,12 +877,12 @@ export function createInpainter(opts: InpainterOptions): Inpainter {
     count = c;
     if (mode === "smart") {
       // Радиус Telea подбирается ПОД БЮДЖЕТ: count·πR² ≤ budget.
-      // Telea остаётся Telea при любом размере маски — никакой подмены
-      // диффузией и никакого даунскейла; для гигантских масок (r<2)
-      // используется гармоническая диффузия в полном разрешении.
+      // Пока окрестность полноценная (r ≥ 5) — Telea: структурное продолжение
+      // фона. Если маска слишком крупная для Telea — crossFill: продолжение
+      // фона по строкам/столбцам, без «размазывания» цветов к центру.
       const rMax = Math.floor(Math.sqrt(opts.budget / (Math.PI * Math.max(1, count))));
       teleaR = Math.max(2, Math.min(radius, rMax));
-      useTelea = rMax >= 2;
+      useTelea = rMax >= 5;
     }
     lastDx = dx;
     lastDy = dy;
@@ -754,10 +903,16 @@ export function createInpainter(opts: InpainterOptions): Inpainter {
 
     if (mode === "smart" && useTelea) {
       inpaintTelea(img, maskFull, teleaR);
+    } else if (mode === "smart") {
+      // крупная область: продолжение фона по строкам/столбцам.
+      // Каждый пиксель получает интерполяцию между ближайшими известными
+      // слева/справа и сверху/снизу — градиент неба/стены сохраняется,
+      // «цветовой каши» в форме маски не возникает.
+      crossFill(img, maskFull);
     } else {
-      // диффузия в полном разрешении + растушёвка границы
+      // dissolve: то же заполнение + мягкая растушёвка границы области
       const orig = new Uint8ClampedArray(img.data);
-      diffusionFill(img, maskFull, passesFor(count));
+      crossFill(img, maskFull);
       const alpha = featherAlpha(maskFull, bw, bh, feather);
       const d = img.data;
       for (let i = 0; i < n; i++) {
