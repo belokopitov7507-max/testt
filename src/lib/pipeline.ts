@@ -440,10 +440,11 @@ function detectTightMaskFromFrame(
   }
   if (keptCount < 16 || keptCount > 0.7 * n) return null;
 
-  // расширение + неуверенная полоса (полупрозрачное гало и антиалиасинг знака)
-  let mask = dilateU8(kept, bw, bh, 3);
-  const band = dilateU8(kept, bw, bh, 8);
-  const T2 = Math.max(6, T * 0.45);
+  // расширение + неуверенная полоса (полупрозрачное гало и антиалиасинг знака;
+  // у жирного текста сглаживание шире — берём с запасом)
+  let mask = dilateU8(kept, bw, bh, 4);
+  const band = dilateU8(kept, bw, bh, 10);
+  const T2 = Math.max(5, T * 0.35);
   for (let i = 0; i < n; i++) {
     if (band[i] && !mask[i] && diff[i] > T2) mask[i] = 1;
   }
@@ -1406,7 +1407,8 @@ async function processWithMediaRecorder(p: Prepared, onStage: (s: string) => voi
 
   outCanvas.width = W;
   outCanvas.height = H;
-  octx.drawImage(video, 0, 0, W, H);
+  // НЕ рисуем сырой кадр: холст должен получить первый кадр уже
+  // восстановленным, иначе рекордер захватит кадр с водяным знаком.
   const stream = outCanvas.captureStream(0);
   const vtrack = stream.getVideoTracks()[0] as (MediaStreamTrack & { requestFrame?: () => void }) | undefined;
   const manualFrames = typeof vtrack?.requestFrame === "function";
@@ -1455,7 +1457,19 @@ async function processWithMediaRecorder(p: Prepared, onStage: (s: string) => voi
     video.currentTime = 0;
     await sleep(150);
   }
+  await awaitFrame(video);
   if (cancelled.current) throw new Error("__cancelled__");
+
+  // Первый кадр восстанавливаем ДО старта записи — на холст никогда не
+  // должен попасть кадр с водяным знаком.
+  try {
+    octx.drawImage(video, 0, 0, W, H);
+    const off0 = track.length ? offsetAt(track, 0) : { dx: 0, dy: 0 };
+    inpaintCurrentFrame(Math.round(off0.dx), Math.round(off0.dy));
+    if (manualFrames) vtrack?.requestFrame?.();
+  } catch (e) {
+    console.warn("Не удалось подготовить первый кадр:", e);
+  }
 
   onStage("Восстанавливаем кадры (реальное время)…");
   rec.start(manualFrames ? 250 : 500);
