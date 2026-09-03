@@ -1,0 +1,178 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink-950: #07090d;
+  --color-ink-900: #0a0d12;
+  --color-ink-850: #0f131b;
+  --color-ink-800: #131924;
+  --color-ink-700: #1b2330;
+  --color-ink-600: #263043;
+  --color-ink-500: #38455e;
+
+  --color-mist-100: #e9edf5;
+  --color-mist-200: #cfd8e6;
+  --color-mist-300: #b3bfd2;
+  --color-mist-400: #8b99b0;
+  --color-mist-500: #66748c;
+  --color-mist-600: #4a566b;
+
+  --color-mark-300: #ffd479;
+  --color-mark-400: #ffb224;
+  --color-mark-500: #f59e0b;
+  --color-mark-600: #d97706;
+
+  --color-rec-400: #ff6a5e;
+  --color-rec-500: #ff4b3e;
+  --color-rec-600: #d63a2f;
+
+  --color-ok-400: #3ecf8e;
+  --color-ok-500: #2fb87c;
+
+  --font-display: "Unbounded", "Golos Text", sans-serif;
+  --font-sans: "Golos Text", "Segoe UI", Tahoma, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", monospace;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: #0a0d12;
+  color: #e9edf5;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+.bg-app {
+  position: relative;
+  background-color: #0a0d12;
+  background-image:
+    radial-gradient(900px 500px at 12% -8%, rgba(255, 75, 62, 0.13), transparent 60%),
+    radial-gradient(800px 520px at 96% 14%, rgba(255, 178, 36, 0.09), transparent 62%),
+    radial-gradient(700px 600px at 50% 115%, rgba(63, 94, 151, 0.14), transparent 60%);
+}
+.bg-app::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(rgba(233, 237, 245, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(233, 237, 245, 0.035) 1px, transparent 1px);
+  background-size: 34px 34px;
+  mask-image: radial-gradient(80% 70% at 50% 30%, #000 40%, transparent 100%);
+  pointer-events: none;
+}
+.bg-app::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(255, 255, 255, 0.012) 0px,
+    rgba(255, 255, 255, 0.012) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  pointer-events: none;
+}
+
+.focus-ring:focus-visible {
+  outline: 2px solid rgba(255, 178, 36, 0.85);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: rgba(255, 178, 36, 0.35);
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: #263043;
+  border-radius: 8px;
+  border: 2px solid #0f131b;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #38455e;
+}
+
+input[type="range"] {
+  accent-color: #ffb224;
+}
+
+@keyframes toastIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.toast-in {
+  animation: toastIn 0.22s ease-out both;
+}
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.fade-up {
+  animation: fadeUp 0.4s ease-out both;
+}
+
+@keyframes pulseDot {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgba(255, 75, 62, 0.55);
+  }
+  50% {
+    opacity: 0.55;
+    box-shadow: 0 0 0 7px rgba(255, 75, 62, 0);
+  }
+}
+.pulse-dot {
+  animation: pulseDot 1.2s ease-in-out infinite;
+}
+
+.drop-active {
+  border-color: rgba(255, 178, 36, 0.9) !important;
+  background: rgba(255, 178, 36, 0.06) !important;
+}
+
+@keyframes stripes {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 28px 0;
+  }
+}
+.bar-stripes {
+  background-image: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.16) 25%,
+    transparent 25%,
+    transparent 50%,
+    rgba(255, 255, 255, 0.16) 50%,
+    rgba(255, 255, 255, 0.16) 75%,
+    transparent 75%,
+    transparent
+  );
+  background-size: 28px 28px;
+  animation: stripes 0.9s linear infinite;
+}

@@ -1,0 +1,1037 @@
+// ============================================================================
+// Движок восстановления изображения (inpainting), чистый TypeScript.
+//
+// Режим «Подбор фона» — алгоритм A. Telea («An Image Inpainting Technique
+// Based on the Fast Marching Method», 2004): волна распространяется от
+// границы маски внутрь, каждый пиксель получает цвет как взвешенную сумму
+// внешних известных соседей с продолжением градиента изображения.
+//
+// Режим «Растворение» — диффузионное (гармоническое) заполнение области
+// с растушёвкой границы: знак плавно растворяется в окружении.
+//
+// Качество:
+//   • grain transfer — перенос уровня плёночного шума фона в зону;
+//   • НИКАКОГО даунскейла: малые маски — Telea полным радиусом, большие —
+//     гармоническая диффузия в полном разрешении (апскейла нет → нет
+//     размытия), время кадра ограничено числом итераций, а не масштабом.
+// ============================================================================
+
+const KNOWN = 0;
+const BAND = 1;
+const INSIDE = 2;
+
+/** Бинарная куча минимумов по ключу T (приоритет фронта волны). */
+class MinHeap {
+  private idx: Int32Array;
+  private key: Float32Array;
+  size = 0;
+
+  constructor(cap: number, key: Float32Array) {
+    this.idx = new Int32Array(cap + 8);
+    this.key = key;
+  }
+
+  push(i: number): void {
+    const a = this.idx;
+    const k = this.key;
+    let j = this.size++;
+    while (j > 0) {
+      const p = (j - 1) >> 1;
+      if (k[a[p]] <= k[i]) break;
+      a[j] = a[p];
+      j = p;
+    }
+    a[j] = i;
+  }
+
+  pop(): number {
+    const a = this.idx;
+    const k = this.key;
+    const top = a[0];
+    const last = a[--this.size];
+    let j = 0;
+    for (;;) {
+      const l = j * 2 + 1;
+      if (l >= this.size) break;
+      let m = l;
+      const r = l + 1;
+      if (r < this.size && k[a[r]] < k[a[l]]) m = r;
+      if (k[last] <= k[a[m]]) break;
+      a[j] = a[m];
+      j = m;
+    }
+    a[j] = last;
+    return top;
+  }
+}
+
+/** Локальное решение уравнения эйконала |∇T| = 1 по известным соседям. */
+function solveEikonal(i: number, x: number, y: number, w: number, h: number, T: Float32Array, flag: Uint8Array): number {
+  let tX = Infinity;
+  let tY = Infinity;
+  if (x > 0 && flag[i - 1] === KNOWN) tX = Math.min(tX, T[i - 1]);
+  if (x < w - 1 && flag[i + 1] === KNOWN) tX = Math.min(tX, T[i + 1]);
+  if (y > 0 && flag[i - w] === KNOWN) tY = Math.min(tY, T[i - w]);
+  if (y < h - 1 && flag[i + w] === KNOWN) tY = Math.min(tY, T[i + w]);
+
+  if (tX < Infinity && tY < Infinity) {
+    const d = (tX - tY) * (tX - tY);
+    if (d <= 2) return (tX + tY + Math.sqrt(2 - d)) * 0.5;
+    return Math.max(tX, tY) + 0.7071067811865476;
+  }
+  if (tX < Infinity) return tX + 1;
+  if (tY < Infinity) return tY + 1;
+  return 1;
+}
+
+export interface DiskOffset {
+  dx: number;
+  dy: number;
+  d2: number;
+  dist: number;
+  invDist: number;
+}
+
+const diskCache = new Map<number, DiskOffset[]>();
+
+function buildDisk(radius: number): DiskOffset[] {
+  const r = Math.max(2, Math.min(24, Math.round(radius)));
+  const cached = diskCache.get(r);
+  if (cached) return cached;
+  const r2 = r * r;
+  const out: DiskOffset[] = [];
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      const d2 = dx * dx + dy * dy;
+      if (d2 > 0 && d2 <= r2) {
+        const dist = Math.sqrt(d2);
+        out.push({ dx, dy, d2, dist, invDist: 1 / dist });
+      }
+    }
+  }
+  diskCache.set(r, out);
+  return out;
+}
+
+/** Быстрое приближение нормального распределения (Box–Muller). */
+function gauss(): number {
+  const u = 1 - Math.random();
+  const v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+/**
+ * Оценка уровня шума (σ) в известной зоне по лапласиану:
+ * для белого шума Var(∇²I) = 20·σ². Только пиксели вдали от маски;
+ * число отсчётов ограничено, чтобы не съедать бюджет кадра.
+ */
+function estimateNoise(data: Uint8ClampedArray, w: number, h: number, wasInside: Uint8Array): number {
+  let sum = 0;
+  let cnt = 0;
+  for (let y = 2; y < h - 2 && cnt < 20000; y += 1) {
+    const row = y * w;
+    for (let x = 2; x < w - 2 && cnt < 20000; x += 1) {
+      const i = row + x;
+      if (wasInside[i]) continue;
+      let clean = true;
+      for (let dy = -2; dy <= 2 && clean; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          if (wasInside[i + dy * w + dx]) {
+            clean = false;
+            break;
+          }
+        }
+      }
+      if (!clean) continue;
+      const p4 = i << 2;
+      const l = (c: number) => (data[c] * 77 + data[c + 1] * 150 + data[c + 2] * 29) >> 8;
+      const lap = 4 * l(p4) - l(p4 - 4) - l(p4 + 4) - l((i - w) << 2) - l((i + w) << 2);
+      sum += lap * lap;
+      cnt++;
+    }
+  }
+  if (cnt < 64) return 0;
+  return Math.sqrt(sum / (20 * cnt));
+}
+
+/** Перенос шума фона в восстановленную зону (против «гладкой заплатки»). */
+function applyGrain(img: ImageData, wasInside: Uint8Array, sigma: number): void {
+  if (sigma < 0.75) return;
+  const sLuma = sigma * 0.9;
+  const sChroma = sigma * 0.45;
+  const w = img.width;
+  const h = img.height;
+  const n = w * h;
+  const data = img.data;
+  for (let i = 0; i < n; i++) {
+    if (!wasInside[i]) continue;
+    const i4 = i << 2;
+    const nl = gauss() * sLuma;
+    let v = data[i4] + nl + gauss() * sChroma;
+    data[i4] = v < 0 ? 0 : v > 255 ? 255 : v;
+    v = data[i4 + 1] + nl + gauss() * sChroma;
+    data[i4 + 1] = v < 0 ? 0 : v > 255 ? 255 : v;
+    v = data[i4 + 2] + nl + gauss() * sChroma;
+    data[i4 + 2] = v < 0 ? 0 : v > 255 ? 255 : v;
+    data[i4 + 3] = 255;
+  }
+}
+
+/**
+ * Восстановление области изображения (режим Telea).
+ * @param img       ImageData области (изменяется in-place)
+ * @param maskAlpha маска той же области: > 120 = восстанавливать
+ * @param radius    радиус окрестности, px
+ * @returns true, если были восстановлены пиксели
+ */
+export function inpaintTelea(
+  img: ImageData,
+  maskAlpha: Uint8ClampedArray | Uint8Array,
+  radius: number,
+): boolean {
+  const w = img.width;
+  const h = img.height;
+  const n = w * h;
+  if (n < 4) return false;
+  const data = img.data;
+
+  const flag = new Uint8Array(n);
+  const wasInside = new Uint8Array(n);
+  let insideCount = 0;
+  for (let i = 0; i < n; i++) {
+    if (maskAlpha[i] > 120) {
+      flag[i] = INSIDE;
+      wasInside[i] = 1;
+      insideCount++;
+    }
+  }
+  if (insideCount === 0) return false;
+  if (insideCount === n) return false; // вся область — маска: восстанавливать неоткуда
+
+  const T = new Float32Array(n);
+  for (let i = 0; i < n; i++) T[i] = flag[i] === INSIDE ? Infinity : 0;
+
+  const heap = new MinHeap(n, T);
+
+  // инициируем узкую полосу: INSIDE-пиксели, смежные с известными
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      if (flag[i] !== INSIDE) continue;
+      let border = false;
+      for (let dy = -1; dy <= 1 && !border; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= h) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= w) continue;
+          if (flag[yy * w + xx] !== INSIDE) {
+            border = true;
+            break;
+          }
+        }
+      }
+      if (border) {
+        flag[i] = BAND;
+        T[i] = solveEikonal(i, x, y, w, h, T, flag);
+        heap.push(i);
+      }
+    }
+  }
+
+  const disk = buildDisk(radius);
+
+  while (heap.size > 0) {
+    const p = heap.pop();
+    if (flag[p] === KNOWN) continue; // устаревшая запись кучи
+    flag[p] = KNOWN;
+
+    const px = p % w;
+    const py = (p - px) / w;
+
+    // градиент времени волны ∇T(p)
+    const tL = px > 0 && flag[p - 1] === KNOWN ? T[p - 1] : T[p];
+    const tR = px < w - 1 && flag[p + 1] === KNOWN ? T[p + 1] : T[p];
+    const tU = py > 0 && flag[p - w] === KNOWN ? T[p - w] : T[p];
+    const tD = py < h - 1 && flag[p + w] === KNOWN ? T[p + w] : T[p];
+    const gtx = (tR - tL) * 0.5;
+    const gty = (tD - tU) * 0.5;
+    const gLen = Math.sqrt(gtx * gtx + gty * gty);
+
+    // взвешенное продолжение цвета и градиентов изображения
+    let sw = 0;
+    let sr = 0;
+    let sg = 0;
+    let sb = 0;
+    for (let k = 0; k < disk.length; k++) {
+      const o = disk[k];
+      const qx = px + o.dx;
+      const qy = py + o.dy;
+      if (qx < 0 || qx >= w || qy < 0 || qy >= h) continue;
+      const q = qy * w + qx;
+      if (flag[q] !== KNOWN) continue;
+
+      // weight = dir·lev·dst = |∇T·d|·lev / d² — без sqrt в горячем цикле
+      const dot = gtx * o.dx + gty * o.dy;
+      const dotAbs = dot < 0 ? -dot : dot;
+      const lev = 1 / (1 + T[q]);
+      let weight: number;
+      if (gLen < 1e-6 || dotAbs < 1e-4 * o.dist) {
+        weight = 1e-3 * lev * o.invDist; // вырожденный фронт
+      } else {
+        weight = (dotAbs * lev) / o.d2;
+      }
+
+      const q4 = q << 2;
+      // градиент изображения в q (центральные разности по известным)
+      const ql = qx > 0 && flag[q - 1] === KNOWN ? q - 1 : q;
+      const qr = qx < w - 1 && flag[q + 1] === KNOWN ? q + 1 : q;
+      const qu = qy > 0 && flag[q - w] === KNOWN ? q - w : q;
+      const qdIdx = qy < h - 1 ? q + w : q;
+      const l4 = ql << 2;
+      const r4 = qr << 2;
+      const u4 = qu << 2;
+      const d4 = qdIdx << 2;
+
+      // I(p) ≈ I(q) + ∇I(q)·(p−q);  p−q = (−dx, −dy)
+      const mx = -o.dx;
+      const my = -o.dy;
+      sr += weight * (data[q4] + (data[r4] - data[l4]) * 0.5 * mx + (data[d4] - data[u4]) * 0.5 * my);
+      sg += weight * (data[q4 + 1] + (data[r4 + 1] - data[l4 + 1]) * 0.5 * mx + (data[d4 + 1] - data[u4 + 1]) * 0.5 * my);
+      sb += weight * (data[q4 + 2] + (data[r4 + 2] - data[l4 + 2]) * 0.5 * mx + (data[d4 + 2] - data[u4 + 2]) * 0.5 * my);
+      sw += weight;
+    }
+
+    const p4 = p << 2;
+    if (sw > 1e-9) {
+      let v = sr / sw;
+      data[p4] = v < 0 ? 0 : v > 255 ? 255 : v;
+      v = sg / sw;
+      data[p4 + 1] = v < 0 ? 0 : v > 255 ? 255 : v;
+      v = sb / sw;
+      data[p4 + 2] = v < 0 ? 0 : v > 255 ? 255 : v;
+      data[p4 + 3] = 255;
+    } else {
+      // страховка: среднее известных 8-соседей
+      let ar = 0;
+      let ag = 0;
+      let ab = 0;
+      let cnt = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = py + dy;
+        if (yy < 0 || yy >= h) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          if (!dx && !dy) continue;
+          const xx = px + dx;
+          if (xx < 0 || xx >= w) continue;
+          const q = yy * w + xx;
+          if (flag[q] !== KNOWN) continue;
+          const q4 = q << 2;
+          ar += data[q4];
+          ag += data[q4 + 1];
+          ab += data[q4 + 2];
+          cnt++;
+        }
+      }
+      if (cnt > 0) {
+        data[p4] = ar / cnt;
+        data[p4 + 1] = ag / cnt;
+        data[p4 + 2] = ab / cnt;
+        data[p4 + 3] = 255;
+      }
+    }
+
+    // релаксация соседей: расширяем фронт
+    for (let dy = -1; dy <= 1; dy++) {
+      const yy = py + dy;
+      if (yy < 0 || yy >= h) continue;
+      for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+        const xx = px + dx;
+        if (xx < 0 || xx >= w) continue;
+        const nb = yy * w + xx;
+        if (flag[nb] === INSIDE) {
+          flag[nb] = BAND;
+          T[nb] = solveEikonal(nb, xx, yy, w, h, T, flag);
+          heap.push(nb);
+        }
+      }
+    }
+  }
+
+  // зерно добавляет оркестратор (createInpainter) с кешированной оценкой σ —
+  // иначе оценка шума съедала бы бюджет каждого кадра
+  return true;
+}
+
+/** Переносимый box-blur (для браузеров без canvas.filter). */
+export function boxBlurRGBA(src: Uint8ClampedArray, w: number, h: number, r: number): Uint8ClampedArray {
+  const tmp = new Uint8ClampedArray(src.length);
+  const out = new Uint8ClampedArray(src.length);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      let R = 0;
+      let G = 0;
+      let B = 0;
+      let cnt = 0;
+      for (let d = -r; d <= r; d++) {
+        const xx = x + d;
+        if (xx < 0 || xx >= w) continue;
+        const q = (row + xx) << 2;
+        R += src[q];
+        G += src[q + 1];
+        B += src[q + 2];
+        cnt++;
+      }
+      const q = (row + x) << 2;
+      tmp[q] = R / cnt;
+      tmp[q + 1] = G / cnt;
+      tmp[q + 2] = B / cnt;
+      tmp[q + 3] = 255;
+    }
+  }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let R = 0;
+      let G = 0;
+      let B = 0;
+      let cnt = 0;
+      for (let d = -r; d <= r; d++) {
+        const yy = y + d;
+        if (yy < 0 || yy >= h) continue;
+        const q = (yy * w + x) << 2;
+        R += tmp[q];
+        G += tmp[q + 1];
+        B += tmp[q + 2];
+        cnt++;
+      }
+      const q = (y * w + x) << 2;
+      out[q] = R / cnt;
+      out[q + 1] = G / cnt;
+      out[q + 2] = B / cnt;
+      out[q + 3] = 255;
+    }
+  }
+  return out;
+}
+
+// ============================================================================
+// Диффузионное (гармоническое) заполнение — основа «Растворения» и
+// качественного фолбэка для больших масок в «Подборе фона»
+// ============================================================================
+
+/**
+ * Инициализация внутренности маски блоковыми средними фона
+ * (билинейная интерполяция сетки средних) — пространственно-переменный
+ * гладкий фон вместо одноцветного пятна.
+ */
+function blockMeanInit(d: Uint8ClampedArray, mask: Uint8Array, w: number, h: number, inside: Int32Array, count: number): void {
+  let gr = 0;
+  let gg = 0;
+  let gb = 0;
+  let gk = 0;
+  for (let i = 0; i < w * h; i++) {
+    if (mask[i]) continue;
+    const q = i << 2;
+    gr += d[q];
+    gg += d[q + 1];
+    gb += d[q + 2];
+    gk++;
+  }
+  const mr = gk > 0 ? gr / gk : 128;
+  const mg = gk > 0 ? gg / gk : 128;
+  const mb = gk > 0 ? gb / gk : 128;
+
+  const B = 16;
+  const gw = Math.ceil(w / B);
+  const gh = Math.ceil(h / B);
+  const bn = gw * gh;
+  const br = new Float32Array(bn);
+  const bg = new Float32Array(bn);
+  const bb = new Float32Array(bn);
+  const bc = new Float32Array(bn);
+  for (let y = 0; y < h; y++) {
+    const by = ((y / B) | 0) * gw;
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      if (mask[i]) continue;
+      const bi = by + ((x / B) | 0);
+      const q = i << 2;
+      br[bi] += d[q];
+      bg[bi] += d[q + 1];
+      bb[bi] += d[q + 2];
+      bc[bi]++;
+    }
+  }
+  for (let i = 0; i < bn; i++) {
+    if (bc[i] > 0) {
+      br[i] /= bc[i];
+      bg[i] /= bc[i];
+      bb[i] /= bc[i];
+    } else {
+      br[i] = mr;
+      bg[i] = mg;
+      bb[i] = mb;
+    }
+  }
+  const sample = (arr: Float32Array, x: number, y: number): number => {
+    const fx = Math.min(gw - 1.001, Math.max(0, x / B - 0.5));
+    const fy = Math.min(gh - 1.001, Math.max(0, y / B - 0.5));
+    const x0 = fx | 0;
+    const y0 = fy | 0;
+    const tx = fx - x0;
+    const ty = fy - y0;
+    const x1 = Math.min(gw - 1, x0 + 1);
+    const y1 = Math.min(gh - 1, y0 + 1);
+    const top = arr[y0 * gw + x0] * (1 - tx) + arr[y0 * gw + x1] * tx;
+    const bot = arr[y1 * gw + x0] * (1 - tx) + arr[y1 * gw + x1] * tx;
+    return top * (1 - ty) + bot * ty;
+  };
+  for (let k = 0; k < count; k++) {
+    const i = inside[k];
+    const x = i % w;
+    const y = (i - x) / w;
+    const q = i << 2;
+    d[q] = sample(br, x, y);
+    d[q + 1] = sample(bg, x, y);
+    d[q + 2] = sample(bb, x, y);
+  }
+}
+
+/**
+ * Диффузионное заполнение: итеративное усреднение (Гаусс–Зейдель) пикселей
+ * маски по 4 соседям; граница зафиксирована. Результат — гладкое
+ * гармоническое продолжение фона: знак «растворяется».
+ */
+export function diffusionFill(img: ImageData, mask: Uint8Array, passes: number): boolean {
+  const w = img.width;
+  const h = img.height;
+  const n = w * h;
+  const d = img.data;
+
+  const inside = new Int32Array(n);
+  let count = 0;
+  for (let i = 0; i < n; i++) {
+    if (mask[i]) inside[count++] = i;
+  }
+  if (count === 0 || count === n) return false;
+
+  blockMeanInit(d, mask, w, h, inside, count);
+
+  const P = Math.max(10, Math.min(120, Math.round(passes)));
+  for (let pass = 0; pass < P; pass++) {
+    for (let k = 0; k < count; k++) {
+      const i = inside[k];
+      const x = i % w;
+      const y = (i - x) / w;
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let c = 0;
+      if (x > 0) {
+        const q = (i - 1) << 2;
+        r += d[q];
+        g += d[q + 1];
+        b += d[q + 2];
+        c++;
+      }
+      if (x < w - 1) {
+        const q = (i + 1) << 2;
+        r += d[q];
+        g += d[q + 1];
+        b += d[q + 2];
+        c++;
+      }
+      if (y > 0) {
+        const q = (i - w) << 2;
+        r += d[q];
+        g += d[q + 1];
+        b += d[q + 2];
+        c++;
+      }
+      if (y < h - 1) {
+        const q = (i + w) << 2;
+        r += d[q];
+        g += d[q + 1];
+        b += d[q + 2];
+        c++;
+      }
+      if (c > 0) {
+        const q = i << 2;
+        d[q] = r / c;
+        d[q + 1] = g / c;
+        d[q + 2] = b / c;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Растушёвка: для каждого пикселя вне маски — расстояние (chamfer) до маски;
+ * alpha плавно спадает до 0 на расстоянии feather px. Внутри маски — 1.
+ */
+function featherAlpha(mask: Uint8Array, w: number, h: number, feather: number): Float32Array {
+  const n = w * h;
+  const dist = new Float32Array(n);
+  const INF = 1e9;
+  for (let i = 0; i < n; i++) dist[i] = mask[i] ? 0 : INF;
+  const D = 1.4142135;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      let v = dist[i];
+      if (v > 0) {
+        if (x > 0) {
+          const t = dist[i - 1] + 1;
+          if (t < v) v = t;
+        }
+        if (y > 0) {
+          const t = dist[i - w] + 1;
+          if (t < v) v = t;
+          if (x > 0) {
+            const t2 = dist[i - w - 1] + D;
+            if (t2 < v) v = t2;
+          }
+          if (x < w - 1) {
+            const t2 = dist[i - w + 1] + D;
+            if (t2 < v) v = t2;
+          }
+        }
+        dist[i] = v;
+      }
+    }
+  }
+  for (let y = h - 1; y >= 0; y--) {
+    const row = y * w;
+    for (let x = w - 1; x >= 0; x--) {
+      const i = row + x;
+      let v = dist[i];
+      if (v > 0) {
+        if (x < w - 1) {
+          const t = dist[i + 1] + 1;
+          if (t < v) v = t;
+        }
+        if (y < h - 1) {
+          const t = dist[i + w] + 1;
+          if (t < v) v = t;
+          if (x < w - 1) {
+            const t2 = dist[i + w + 1] + D;
+            if (t2 < v) v = t2;
+          }
+          if (x > 0) {
+            const t2 = dist[i + w - 1] + D;
+            if (t2 < v) v = t2;
+          }
+        }
+        dist[i] = v;
+      }
+    }
+  }
+  const alpha = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    alpha[i] = mask[i] ? 1 : Math.max(0, 1 - dist[i] / feather);
+  }
+  return alpha;
+}
+
+// ============================================================================
+// Cross-fill: попиксельное продолжение фона по строкам и столбцам.
+// Для каждого пикселя маски берутся ближайшие известные соседи слева/справа
+// (интерполяция) и сверху/снизу, результаты смешиваются с весом 1/расстояние.
+// В отличие от диффузии и Telea на больших сплошных областях, НЕ «размазывает»
+// цвета границ к центру: каждая строка сохраняет свой оттенок — градиенты и
+// плавные фоны продолжаются практически незаметно. O(n), очень быстрый.
+// ============================================================================
+
+export function crossFill(img: ImageData, mask: Uint8Array): boolean {
+  const w = img.width;
+  const h = img.height;
+  const n = w * h;
+  const d = img.data;
+
+  let count = 0;
+  for (let i = 0; i < n; i++) if (mask[i]) count++;
+  if (count === 0 || count === n) return false;
+
+  // ближайшие известные соседи по 4 направлениям (−1 = нет)
+  const leftX = new Int32Array(n);
+  const rightX = new Int32Array(n);
+  const topY = new Int32Array(n);
+  const botY = new Int32Array(n);
+
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let last = -1;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      if (!mask[i]) last = x;
+      leftX[i] = last;
+    }
+    last = -1;
+    for (let x = w - 1; x >= 0; x--) {
+      const i = row + x;
+      if (!mask[i]) last = x;
+      rightX[i] = last;
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let last = -1;
+    for (let y = 0; y < h; y++) {
+      const i = y * w + x;
+      if (!mask[i]) last = y;
+      topY[i] = last;
+    }
+    last = -1;
+    for (let y = h - 1; y >= 0; y--) {
+      const i = y * w + x;
+      if (!mask[i]) last = y;
+      botY[i] = last;
+    }
+  }
+
+  // среднее известных — запасной цвет
+  let mr = 0;
+  let mg = 0;
+  let mb = 0;
+  let mk = 0;
+  for (let i = 0; i < n; i++) {
+    if (mask[i]) continue;
+    const q = i << 2;
+    mr += d[q];
+    mg += d[q + 1];
+    mb += d[q + 2];
+    mk++;
+  }
+  mr = mk > 0 ? mr / mk : 128;
+  mg = mk > 0 ? mg / mk : 128;
+  mb = mk > 0 ? mb / mk : 128;
+
+  for (let i = 0; i < n; i++) {
+    if (!mask[i]) continue;
+    const x = i % w;
+    const y = (i - x) / w;
+    const q = i << 2;
+    let vr = 0;
+    let vg = 0;
+    let vb = 0;
+    let wsum = 0;
+
+    // горизонталь
+    const lx = leftX[i];
+    const rx = rightX[i];
+    if (lx >= 0 && rx >= 0) {
+      const dl = x - lx;
+      const dr = rx - x;
+      const s = dl + dr;
+      const ql = (y * w + lx) << 2;
+      const qr = (y * w + rx) << 2;
+      const wh = 1 / s;
+      vr += ((d[ql] * dr + d[qr] * dl) / s) * wh;
+      vg += ((d[ql + 1] * dr + d[qr + 1] * dl) / s) * wh;
+      vb += ((d[ql + 2] * dr + d[qr + 2] * dl) / s) * wh;
+      wsum += wh;
+    } else if (lx >= 0 || rx >= 0) {
+      const sx = lx >= 0 ? lx : rx;
+      const dist = lx >= 0 ? x - lx : rx - x;
+      const qs = (y * w + sx) << 2;
+      const wh = 1 / (4 * dist);
+      vr += d[qs] * wh;
+      vg += d[qs + 1] * wh;
+      vb += d[qs + 2] * wh;
+      wsum += wh;
+    }
+
+    // вертикаль
+    const ty = topY[i];
+    const by = botY[i];
+    if (ty >= 0 && by >= 0) {
+      const du = y - ty;
+      const dd = by - y;
+      const s = du + dd;
+      const qu = (ty * w + x) << 2;
+      const qd = (by * w + x) << 2;
+      const wv = 1 / s;
+      vr += ((d[qu] * dd + d[qd] * du) / s) * wv;
+      vg += ((d[qu + 1] * dd + d[qd + 1] * du) / s) * wv;
+      vb += ((d[qu + 2] * dd + d[qd + 2] * du) / s) * wv;
+      wsum += wv;
+    } else if (ty >= 0 || by >= 0) {
+      const sy = ty >= 0 ? ty : by;
+      const dist = ty >= 0 ? y - ty : by - y;
+      const qs = (sy * w + x) << 2;
+      const wv = 1 / (4 * dist);
+      vr += d[qs] * wv;
+      vg += d[qs + 1] * wv;
+      vb += d[qs + 2] * wv;
+      wsum += wv;
+    }
+
+    if (wsum > 0) {
+      let v = vr / wsum;
+      d[q] = v < 0 ? 0 : v > 255 ? 255 : v;
+      v = vg / wsum;
+      d[q + 1] = v < 0 ? 0 : v > 255 ? 255 : v;
+      v = vb / wsum;
+      d[q + 2] = v < 0 ? 0 : v > 255 ? 255 : v;
+    } else {
+      d[q] = mr;
+      d[q + 1] = mg;
+      d[q + 2] = mb;
+    }
+    d[q + 3] = 255;
+  }
+  return true;
+}
+
+/**
+ * Расстояние (chamfer, 4-связное) от каждого пикселя маски до ближайшего
+ * пикселя ВНЕ маски. Нужно для «чистовой» полосы Telea у границы знака.
+ */
+function distInsideToBoundary(mask: Uint8Array, w: number, h: number): Uint16Array {
+  const n = w * h;
+  const d = new Uint16Array(n);
+  const BIG = 65534;
+  for (let i = 0; i < n; i++) d[i] = mask[i] ? BIG : 0;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      if (d[i] === 0) continue;
+      let v = d[i];
+      if (x > 0) {
+        const t = d[i - 1] + 1;
+        if (t < v) v = t;
+      }
+      if (y > 0) {
+        const t = d[i - w] + 1;
+        if (t < v) v = t;
+      }
+      d[i] = v;
+    }
+  }
+  for (let y = h - 1; y >= 0; y--) {
+    const row = y * w;
+    for (let x = w - 1; x >= 0; x--) {
+      const i = row + x;
+      if (d[i] === 0) continue;
+      let v = d[i];
+      if (x < w - 1) {
+        const t = d[i + 1] + 1;
+        if (t < v) v = t;
+      }
+      if (y < h - 1) {
+        const t = d[i + w] + 1;
+        if (t < v) v = t;
+      }
+      d[i] = v;
+    }
+  }
+  return d;
+}
+
+// ============================================================================
+// Адаптивный оркестратор: фиксированное время кадра при любом размере маски
+// ============================================================================
+
+export interface BBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export type RemovalMode = "smart" | "dissolve";
+
+export interface InpainterOptions {
+  bbox: BBox;
+  maskCanvas: HTMLCanvasElement; // полноразмерная маска (белый alpha = зона)
+  radius: number;
+  /** бюджет ≈ допустимое число операций на кадр */
+  budget: number;
+  /** smart = «Подбор фона» (Telea), dissolve = «Растворение» */
+  mode?: RemovalMode;
+}
+
+export interface Inpainter {
+  runFrame(octx: CanvasRenderingContext2D, dx: number, dy: number): void;
+}
+
+function mkCanvas(w: number, h: number): [HTMLCanvasElement, CanvasRenderingContext2D] {
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  return [c, c.getContext("2d", { willReadFrequently: true })!];
+}
+
+export function createInpainter(opts: InpainterOptions): Inpainter {
+  const { bbox, maskCanvas } = opts;
+  const mode: RemovalMode = opts.mode === "dissolve" ? "dissolve" : "smart";
+  const bw = bbox.w;
+  const bh = bbox.h;
+  const n = bw * bh;
+  const radius = Math.max(2, Math.min(100, Math.round(opts.radius)));
+  // растушёвка «Растворения» растёт вместе с радиусом (мягкость перехода)
+  const feather = Math.max(3, Math.min(32, Math.round(radius / 2) + 2));
+  const realtime = opts.budget <= 650_000;
+
+  const [maskRoiC, maskRoiCtx] = mkCanvas(bw, bh);
+  const maskFull = new Uint8Array(n);
+  const maskDil = new Uint8Array(n);
+
+  let lastDx = Number.NaN;
+  let lastDy = Number.NaN;
+  let count = 0;
+  let teleaR = radius;
+  let useTelea = mode === "smart";
+  let sigmaCache = -1;
+
+  /**
+   * Извлечь маску ROI. Вызывается только при СМЕНЕ смещения (для статичного
+   * знака — один раз на всё видео): один drawImage + порог + крестовая
+   * дилатация массивом (дешевле, чем 9 drawImage полного канваса).
+   */
+  const extractMask = (dx: number, dy: number) => {
+    maskRoiCtx.clearRect(0, 0, bw, bh);
+    maskRoiCtx.drawImage(maskCanvas, -bbox.x + dx, -bbox.y + dy);
+    const md = maskRoiCtx.getImageData(0, 0, bw, bh).data;
+    for (let i = 0, j = 3; i < n; i++, j += 4) maskFull[i] = md[j] > 120 ? 255 : 0;
+    // дилатация ~2px (перехват гало/антиалиасинга по краю маски)
+    for (let pass = 0; pass < 2; pass++) {
+      const src = pass === 0 ? maskFull : maskDil;
+      const dst = pass === 0 ? maskDil : maskFull;
+      for (let y = 0; y < bh; y++) {
+        const row = y * bw;
+        for (let x = 0; x < bw; x++) {
+          const i = row + x;
+          let v = src[i];
+          if (!v) {
+            if (x > 0 && src[i - 1]) v = 255;
+            else if (x < bw - 1 && src[i + 1]) v = 255;
+            else if (y > 0 && src[i - bw]) v = 255;
+            else if (y < bh - 1 && src[i + bw]) v = 255;
+          }
+          dst[i] = v;
+        }
+      }
+    }
+    let c = 0;
+    for (let i = 0; i < n; i++) if (maskFull[i]) c++;
+    count = c;
+    if (mode === "smart") {
+      if (radius > 24) {
+        // Радиус больше 24 px = «брать фон издалека». У Telea окрестность
+        // ограничена, поэтому широкий охват даёт crossFill: каждая строка и
+        // столбец продолжаются до ближайших известных пикселей на ЛЮБОМ
+        // расстоянии — градиент сохраняется, каши в форме маски нет.
+        useTelea = false;
+      } else {
+        // Чистый Telea — только если ВЕСЬ запрошенный радиус влезает в бюджет
+        // (count·πR² ≤ budget). Иначе — двухпроходная схема (crossFill +
+        // Telea-шов): она лучше на жирном тексте и крупных масках.
+        const rMax = Math.floor(Math.sqrt(opts.budget / (Math.PI * Math.max(1, count))));
+        teleaR = radius;
+        useTelea = rMax >= radius;
+      }
+    }
+    lastDx = dx;
+    lastDy = dy;
+  };
+
+  const passesFor = (cnt: number) => {
+    const base = realtime ? 900_000 : 10_000_000;
+    return Math.max(20, Math.min(90, Math.round(base / Math.max(2000, cnt))));
+  };
+
+  const runFrame = (octx: CanvasRenderingContext2D, dx: number, dy: number) => {
+    // 1) маска: пересчитываем только при смене смещения (трекинг)
+    if (dx !== lastDx || dy !== lastDy) extractMask(dx, dy);
+    if (count === 0 || count === n) return;
+
+    // 2) исходный ROI кадра
+    const img = octx.getImageData(bbox.x, bbox.y, bw, bh);
+
+    if (mode === "smart" && useTelea) {
+      inpaintTelea(img, maskFull, teleaR);
+    } else if (mode === "smart") {
+      // Двухпроходный «Подбор фона» для крупных масок и больших радиусов:
+      //  1) crossFill — грубое, но структурно верное продолжение фона
+      //     (каждая строка/столбец тянется до своих известных пикселей);
+      //  2) Telea заново пересчитывает ПЕРЕХОДНУЮ ПОЛОСУ у границы знака в
+      //     полном разрешении, опираясь на реальные пиксели с обеих сторон —
+      //     шов становится резким, жирные буквы исчезают без «размазни».
+      // Ширина полосы растёт с радиусом → слайдер влияет на результат.
+      crossFill(img, maskFull);
+
+      const rT = Math.max(3, Math.min(24, radius));
+      let bandW = Math.min(40, Math.max(3, Math.round(radius * 0.5)));
+
+      // периметр маски: внутренние пиксели с внешним 4-соседом
+      let perim = 0;
+      for (let y = 0; y < bh; y++) {
+        const row = y * bw;
+        for (let x = 0; x < bw; x++) {
+          const i = row + x;
+          if (!maskFull[i]) continue;
+          if (
+            x === 0 || x === bw - 1 || y === 0 || y === bh - 1 ||
+            !maskFull[i - 1] || !maskFull[i + 1] || !maskFull[i - bw] || !maskFull[i + bw]
+          ) {
+            perim++;
+          }
+        }
+      }
+      let rTeff = rT;
+      let piRT2 = Math.PI * rTeff * rTeff;
+      while (bandW > 3 && perim * bandW * piRT2 > opts.budget * 1.2) bandW -= 2;
+      if (perim * bandW * piRT2 > opts.budget * 1.5 && rTeff > 5) {
+        // всё ещё дорого — сужаем окрестность Telea, шов оставляем
+        rTeff = 5;
+        piRT2 = Math.PI * rTeff * rTeff;
+      }
+
+      if (perim > 0 && bandW >= 3 && perim * bandW * piRT2 <= opts.budget * 1.5) {
+        const dist = distInsideToBoundary(maskFull, bw, bh);
+        const bandMask = new Uint8Array(n);
+        let bandCount = 0;
+        for (let i = 0; i < n; i++) {
+          if (maskFull[i] && dist[i] <= bandW) {
+            bandMask[i] = 1;
+            bandCount++;
+          }
+        }
+        // Telea по полосе: «известно» всё, кроме полосы — и внешний фон,
+        // и уже заполненная сердцевина; волна даёт резкий структурный шов.
+        if (bandCount > 0 && bandCount < n) {
+          inpaintTelea(img, bandMask, rTeff);
+        }
+      }
+    } else {
+      // dissolve: то же заполнение + мягкая растушёвка границы области
+      const orig = new Uint8ClampedArray(img.data);
+      crossFill(img, maskFull);
+      const alpha = featherAlpha(maskFull, bw, bh, feather);
+      const d = img.data;
+      for (let i = 0; i < n; i++) {
+        if (maskFull[i]) continue;
+        const a = alpha[i];
+        if (a <= 0) continue;
+        const q = i << 2;
+        d[q] = orig[q] + (d[q] - orig[q]) * a;
+        d[q + 1] = orig[q + 1] + (d[q + 1] - orig[q + 1]) * a;
+        d[q + 2] = orig[q + 2] + (d[q + 2] - orig[q + 2]) * a;
+      }
+    }
+
+    // 3) зерно: σ оцениваем один раз за всё видео, шум генерируем каждый кадр
+    if (sigmaCache < 0) sigmaCache = estimateNoise(img.data, bw, bh, maskFull);
+    applyGrain(img, maskFull, sigmaCache);
+    octx.putImageData(img, bbox.x, bbox.y);
+  };
+
+  return { runFrame };
+}
